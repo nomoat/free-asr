@@ -1,154 +1,199 @@
-# 豆包输入法 macOS 版 (v1.0.2) 流式语音识别 (ASR) 完整协议规范
+# Doubao IME (macOS v1.0.2) Streaming Speech-to-Text (ASR) Protocol Specification
 
-本文档记录对 `/Library/Input Methods/DoubaoIme.app`（v1.0.2）语音输入全链路及字节跳动 SAMI Core SDK（`mac_14.91.26-alpha.1-oinput`）的静态反编译与在线实测验证结果。
-
----
-
-## 1. 整体架构概览
-
-```
-[快捷键触发: CGEventTap (Fn / 修饰键长按或单击)]
-        │
-        ▼
-[音频采集: AVCaptureSession -> AVAudioConverter]
-  输入: 麦克风原生采样率/声道
-  输出: 16,000 Hz, 单声道 (channel=1), 16-bit Signed LE PCM
-  分块: maxBlockSize = 3,200 bytes (每块 100 ms)
-        │
-        ▼
-[传输编码层: SAMI Core SDK (sami_core)]
-  支持两种在线音频格式:
-  1. "pcm": 裸 16kHz 16-bit LE PCM 直传 (enable_net_transport_compress = 0)
-  2. "speech_opus" / "ogg_opus": Opus 编码 (16kHz, CBR 32kbps, 20ms 帧)
-        │
-        ▼
-[长连接层: WebSocket over TLS]
-  地址: wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws
-  备用: wss://frontier-audio-ime-quic.doubao.com/api/v1/ws
-  帧格式: WebSocket Binary Frame 承载 Protobuf (mammon_internal.WebSocketRequest / WebSocketResponse)
-        │
-        ▼
-[流式识别与多遍重打分 (Two-Pass / Three-Pass)]
-  - 中间结果 (is_interim=true): 实时返回加标点文本 (results[0]) 与无标点流式文本 (results[1])
-  - 最终结果 (is_interim=false, is_vad_finished=true): FinishSession 后约 250~320ms 返回大模型重打分结果
-        │
-        ▼
-[上屏与后处理]
-  - 逐字上屏 (ASRTypeWriter): 计算新旧文本公共前缀，仅替换尾部差异 (setMarkedText -> insertText / Cmd-V)
-  - 可选 AI 智能整理 (SmartOrganize): POST /api/v2/ai/text_organization (SSE text/event-stream)
-  - 可选修改对上传 (ModifyPair): POST /api/v3/context/ime/modify_pair/v2
-```
+This document specifies the complete wire protocol, authentication model, Protobuf framing, and JSON schemas for the unauthenticated real-time streaming Speech-to-Text (ASR) service used by **Doubao Input Method for macOS** (`/Library/Input Methods/DoubaoIme.app`, v1.0.2, embedding ByteDance SAMI Core SDK `mac_14.91.26-alpha.1-oinput`).
 
 ---
 
-## 2. WebSocket 握手与免登录鉴权
+## 1. Architecture Overview
 
-豆包输入法语音识别采用**设备级免登录鉴权**（`tokenType = 1`），无需登录豆包账号。
+```
+[Global Shortcut Trigger: CGEventTap (Fn / Modifier Hold or Tap)]
+        │
+        ▼
+[Audio Capture: AVCaptureSession / AVAudioEngine -> AVAudioConverter]
+  Input : Hardware microphone native format (e.g. 48,000 Hz Float32)
+  Output: 16,000 Hz, 1 channel (mono), 16-bit Signed Little-Endian PCM
+  Chunk : maxBlockSize = 3,200 bytes (100 ms per chunk)
+        │
+        ▼
+[Codec Layer: SAMI Core SDK (sami_core)]
+  Two supported online wire formats in StartSession:
+  1. "pcm"        : Raw 16kHz 16-bit mono LE PCM (when enable_net_transport_compress == 0)
+  2. "speech_opus": Opus encoded frames (16kHz, mono, CBR 32 kbps, 20 ms frames)
+        │
+        ▼
+[Transport Layer: WebSocket over TLS]
+  Primary Endpoint : wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws
+  QUIC Alternative : wss://frontier-audio-ime-quic.doubao.com/api/v1/ws
+  Framing          : WebSocket Binary Frames carrying Protobuf (mammon_internal.WebSocketRequest / WebSocketResponse)
+        │
+        ▼
+[Streaming Recognition & Multi-Pass Rescoring]
+  - Interim Results (is_interim=true) : Real-time punctuated/ITN text (results[0]) + raw unpunctuated text (results[1])
+  - Final Result    (is_interim=false): Server-side Two-Pass / Three-Pass LLM rescored transcript (~250-320 ms after FinishSession)
+        │
+        ▼
+[Commit & Optional Post-Processing]
+  - Typewriter diffing (ASRTypeWriter.updateResult): Computes common prefix, replaces only changed suffix
+  - Optional AI Smart Organize: POST /api/v2/ai/text_organization (SSE text/event-stream)
+  - Optional ModifyPair Upload: POST /api/v3/context/ime/modify_pair/v2
+```
 
-### 2.1 连接 URL 与 Query 参数
+---
 
-基础地址：
+## 2. Authentication & Validation Mechanism (Why No Login or Registration Is Needed)
+
+### 2.1 How the Official Client Obtains `device_id`
+On first launch, `DoubaoIme.app` initializes ByteDance's telemetry SDK (`libapplogrs.dylib`), which asynchronously registers the machine and caches a 64-bit integer `device_id` and `install_id` in `~/Library/Application Support/DoubaoIme/AppLog/keyboard/applog.cache2` (exposed in Swift via `OimeCommon.AppInfo.deviceID` @ `0x91c4`).
+
+### 2.2 How the ASR Server Actually Validates Requests (`tokenType = 1` / `TOKEN_TO_C`)
+In `SAMIHandle.swift` (`0x100b3913c`), the client configures `SAMICore_AsrContextCreateParameterV2` with:
+- `setTokenType(1)` (`TOKEN_TO_C`, i.e., consumer device-level authentication rather than user-account authentication)
+- `setToken("{\"device_id\":\"<deviceID>\",\"aid\":\"685343\"}")` (`OdinToken` struct @ `0x101184bac`)
+- `setAppKey("OrnqKvSSrs")`
+
+In `ServiceWrapper::Init` (`0x100293af4`), when `tokenType == 1`:
+1. The SDK parses the `token` JSON object.
+2. Any keys matching `"device_id"`, `"iid"`, or `"aid"` are extracted and appended to the **WebSocket URL query string**.
+3. The `token` field inside the Protobuf `WebSocketRequest` message (field 1) is cleared to `""` (`AsrOnWorker::Init` @ `0x10028b5fc`: `if (tokenType != 0) token = "";`).
+
+**Crucial Finding (Verified Against Production):**
+The ASR WebSocket gateway (`frontier-audio-ime-ws.doubao.com`) **does not check whether `device_id` is registered in ByteDance's `applog` database**.
+- **Reason**: An input method must work the instant a user installs it and presses the voice hotkey, even if the background telemetry registration has not completed or was blocked.
+- **Verification**: Passing **any randomly generated 16-digit numeric string** (e.g., `7391846205183947`) as `device_id` succeeds immediately with `status_code = 20000000 (OK)`.
+- **What the server actually checks**:
+  1. **URL Query**: `aid=685343` and a non-empty `device_id`.
+  2. **HTTP Headers**: `proto-version: v2`, `sdk-version: 2`, `x-tt-e-k: <device_id>+W`, and `x-custom-keepalive: true`.
+  3. **Protobuf Request Fields**: `appkey = "OrnqKvSSrs"` and `namespace = "ASR"`.
+  4. No cookies, no HMAC signatures, and no user tokens (`x-tt-token` is empty) are required.
+
+---
+
+## 3. WebSocket Handshake Specification
+
+### 3.1 Endpoint & Query Parameters
+
 ```
 wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws
+  ?aid=685343
+  &device_id=7391846205183947
+  &app_name=oime_macos
+  &channel=release
+  &device_platform=mac
+  &device_type=mac
+  &device_brand=Apple
+  &os=macOS
+  &os_version=15.6.0
+  &version_code=1.0.2
+  &version_name=1.0.2
+  &update_version_code=1
+  &build_number=1.0.2
+  &app_version=1.0.2
 ```
 
-在 `ServiceWrapper::Init` (`0x100293af4`) 中，SDK 将 `OdinToken` JSON（`{"device_id": "...", "aid": "685343"}`）中的 `device_id`、`aid`、`iid` 合并进 URL Query 参数（连同 `OimeCommon.DeviceInfo.commonParams`）：
-
-| Query 参数名 | 示例值 | 是否必填 | 说明 |
+| Query Parameter | Example Value | Required | Source in Binary |
 |---|---|---|---|
-| `aid` | `685343` | **是** | 豆包输入法 macOS 版固定 App ID (`0x000a751f`) |
-| `device_id` | `2451255482369287` | **是** | 16 位数字字符串（实测任意随机 16 位数字均可直接通过，无需预注册） |
-| `app_name` | `oime_macos` | 推荐 | 应用标识 (`AppInfo.appName`) |
-| `channel` | `release` | 推荐 | 渠道名 |
-| `device_platform` | `mac` | 推荐 | 平台标识 |
-| `device_type` | `mac` | 推荐 | 设备类型 |
-| `device_brand` | `Apple` | 推荐 | 品牌 |
-| `os` | `macOS` | 推荐 | 操作系统 |
-| `os_version` | `15.6.0` | 推荐 | 系统版本 |
-| `version_code` | `1.0.2` | 推荐 | 客户端版本 |
-| `version_name` | `1.0.2` | 推荐 | 客户端版本名 |
-| `update_version_code` | `1` | 可选 | 构建号 |
-| `build_number` | `1.0.2` | 可选 | 构建版本 |
-| `app_version` | `1.0.2` | 可选 | 应用版本 |
+| `aid` | `685343` | **Yes** | `OimeCommon.AppInfo.appID` (`0x6f54`) / `OdinToken.appID` |
+| `device_id` | Any 16-digit number | **Yes** | `OdinToken.deviceID` (`0x100b22de4`) |
+| `app_name` | `oime_macos` | Recommended | `OimeCommon.AppInfo.appName` (`0x3b54`) |
+| `channel` | `release` | Recommended | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `device_platform` | `mac` | Recommended | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `device_type` | `mac` | Recommended | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `device_brand` | `Apple` | Recommended | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `os` | `macOS` | Recommended | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `os_version` | `15.6.0` | Recommended | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `version_code` | `1.0.2` | Recommended | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `version_name` | `1.0.2` | Recommended | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `update_version_code` | `1` | Optional | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `build_number` | `1.0.2` | Optional | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
+| `app_version` | `1.0.2` | Optional | `OimeCommon.DeviceInfo.commonParams` (`0x19a50`) |
 
-### 2.2 HTTP 握手请求头 (Headers)
+### 3.2 HTTP Handshake Headers
 
-在 `SAMIHandle.swift` (`0x100b2374c` / `0x100b22870`) 与 `ServiceWrapper::Init` (`0x100293af4`) 中构造：
+Constructed in `SAMIHandle.swift` (`FUN_100b2374c` / `Header.encode(to:)` @ `0x100b22870`) and `ServiceWrapper::Init` (`0x100293af4`):
 
-| Header 名称 | 值 | 说明 |
-|---|---|---|
-| `proto-version` | `v2` | 协议版本 |
-| `sdk-version` | `2` | SDK 协议代数 |
-| `x-tt-token` | `""`（空字符串） | 未登录时为空字符串 |
-| `x-tt-e-k` | `<device_id>+W` | 例如 `2451255482369287+W` |
-| `x-custom-keepalive` | `true` | 由 `ServiceWrapper::Init` 固定注入 (`0x100ed58e9`) |
-
----
-
-## 3. Protobuf 帧结构 (`proto/websocket_asr.proto`)
-
-除心跳帧（WebSocket Text Frame `"ping"` / `"pong"`）外，所有客户端请求与服务端响应均为 **WebSocket Binary Frame**，载荷为 Protobuf 编码。
-
-### 3.1 客户端请求：`mammon_internal.WebSocketRequest`
-
-由 `WebSocketRequest::SerializeWithCachedSizes` (`0x10098114c`) 还原：
-
-| 字段编号 | 字段名 | Protobuf 类型 | Wire Tag | 说明 |
-|---|---|---|---|---|
-| `1` | `token` | `string` | `0x0a` | `tokenType=1` 时置空 `""`（已在 URL Query 传递 `device_id` 与 `aid`） |
-| `2` | `appkey` | `string` | `0x12` | 固定 10 字符常量：`"OrnqKvSSrs"` |
-| `3` | `namespace` | `string` | `0x1a` | 固定常量：`"ASR"` |
-| `4` | `version` | `string` | `0x22` | 空 `""` |
-| `5` | `event` | `string` | `0x2a` | `"StartTask"` / `"StartSession"` / `"TaskRequest"` / `"FinishSession"` / `"FinishTask"` |
-| `6` | `payload` | `string` | `0x32` | UTF-8 JSON 字符串（见第 4 节） |
-| `7` | `data` | `bytes` | `0x3a` | 仅在 `event == "TaskRequest"` 时携带音频块字节 |
-| `8` | `task_id` | `string` | `0x42` | 32 位小写 hex UUID（一次识别会话内所有帧保持一致） |
-| `9` | `seq_id` | `uint64` | `0x48` | 仅在 `event == "TaskRequest"` 时携带，从 `1` 开始递增 |
-| `10` | `session_id` | `string` | `0x52` | 空 `""` |
-
-### 3.2 服务端响应：`mammon_internal.WebSocketResponse`
-
-由 `WebSocketResponse::MergePartialFromCodedStream` (`0x1009821d0`) 还原：
-
-| 字段编号 | 字段名 | Protobuf 类型 | Wire Tag | 说明 |
-|---|---|---|---|---|
-| `1` | `task_id` | `string` | `0x0a` | 对应请求的 `task_id` |
-| `2` | `message_id` | `string` | `0x12` | 服务端消息 ID |
-| `3` | `namespace` | `string` | `0x1a` | `"ASR"` |
-| `4` | `event` | `string` | `0x22` | `"TaskStarted"` / `"SessionStarted"` / `""`（识别结果帧为空） / `"SessionFinished"` / `"TaskFinished"` / `"SessionFailed"` / `"TaskFailed"` |
-| `5` | `status_code` | `int32` | `0x28` | `20000000` 表示成功 (`OK`) |
-| `6` | `status_text` | `string` | `0x32` | `"OK"` 或错误原因描述 |
-| `7` | `payload` | `string` | `0x3a` | 识别结果 JSON 字符串（见第 4.4 节） |
-| `8` | `data` | `bytes` | `0x42` | 二进制载荷（ASR 中未使用） |
-| `9` | `seq_id` | `uint64` | `0x48` | 序号 |
-| `10` | `session_id` | `string` | `0x52` | 会话 ID |
+```http
+proto-version: v2
+sdk-version: 2
+x-tt-token: 
+x-tt-e-k: 7391846205183947+W
+x-custom-keepalive: true
+```
 
 ---
 
-## 4. 会话状态机与各阶段 JSON Payload
+## 4. Protobuf Wire Schema (`proto/websocket_asr.proto`)
 
-### 4.1 阶段一：启动任务 (`StartTask`)
+All WebSocket messages (except `"ping"` / `"pong"` text heartbeats) are **WebSocket Binary Frames** containing a single serialized Protobuf message.
 
-WebSocket 连接建立后，客户端首先发送 `StartTask`（`BuildStartTaskToPb` @ `0x100292060`）：
+```protobuf
+syntax = "proto3";
+package mammon_internal;
+
+// Decompiled from WebSocketRequest::SerializeWithCachedSizes @ 0x10098114c
+message WebSocketRequest {
+  string token = 1;       // Tag 0x0a: "" when tokenType == 1
+  string appkey = 2;      // Tag 0x12: "OrnqKvSSrs"
+  string namespace = 3;   // Tag 0x1a: "ASR"
+  string version = 4;     // Tag 0x22: ""
+  string event = 5;       // Tag 0x2a: "StartTask" | "StartSession" | "TaskRequest" | "FinishSession" | "FinishTask"
+  string payload = 6;     // Tag 0x32: UTF-8 JSON string
+  bytes  data = 7;        // Tag 0x3a: Raw audio bytes (only when event == "TaskRequest")
+  string task_id = 8;     // Tag 0x42: 32-char lowercase hex UUID (constant across one session)
+  uint64 seq_id = 9;      // Tag 0x48: 1-based incrementing audio chunk index (only when event == "TaskRequest")
+  string session_id = 10; // Tag 0x52: ""
+}
+
+// Decompiled from WebSocketResponse::MergePartialFromCodedStream @ 0x1009821d0
+message WebSocketResponse {
+  string task_id = 1;     // Tag 0x0a
+  string message_id = 2;  // Tag 0x12
+  string namespace = 3;   // Tag 0x1a: "ASR"
+  string event = 4;       // Tag 0x22: "TaskStarted" | "SessionStarted" | "" (ASR result) | "SessionFinished" | "TaskFinished" | "SessionFailed" | "TaskFailed"
+  int32  status_code = 5; // Tag 0x28: 20000000 == OK
+  string status_text = 6; // Tag 0x32: "OK" or error description
+  string payload = 7;     // Tag 0x3a: UTF-8 JSON string with recognition results
+  bytes  data = 8;        // Tag 0x42
+  uint64 seq_id = 9;      // Tag 0x48
+  string session_id = 10; // Tag 0x52
+}
+```
+
+---
+
+## 5. Session State Machine & JSON Payloads
+
+```
+Client                                                 Server
+  |--- [1] WebSocketRequest(event="StartTask") --------->|
+  |--- [2] WebSocketRequest(event="StartSession") ------>|
+  |<-- [3] WebSocketResponse(event="TaskStarted") -------|
+  |<-- [4] WebSocketResponse(event="SessionStarted") ----|
+  |                                                      |
+  |--- [5] WebSocketRequest(event="TaskRequest", seq=1)->|  (100ms / 3200B PCM)
+  |--- [5] WebSocketRequest(event="TaskRequest", seq=2)->|
+  |<-- [6] WebSocketResponse(event="", is_interim=true) -|  (Live streaming preview)
+  |    ...                                               |
+  |--- [7] WebSocketRequest(event="FinishSession") ----->|  (User stops speaking)
+  |<-- [8] WebSocketResponse(event="", is_interim=false)-|  (Three-pass rescored final text)
+  |<-- [9] WebSocketResponse(event="SessionFinished") ---|
+  |--- [10] WebSocketRequest(event="FinishTask") ------->|
+```
+
+### 5.1 Step 1: `StartTask` (`BuildStartTaskToPb` @ `0x100292060`)
+Sent immediately when the WebSocket opens:
 - `appkey`: `"OrnqKvSSrs"`
 - `namespace`: `"ASR"`
 - `event`: `"StartTask"`
-- `task_id`: `<32位hex UUID>`
-- 其余字段为空。
+- `task_id`: `<32-char lowercase hex UUID>`
 
-服务端返回 `WebSocketResponse`：
-- `event`: `"TaskStarted"`
-- `status_code`: `20000000`
-- `status_text`: `"OK"`
-
-### 4.2 阶段二：启动会话 (`StartSession`)
-
-客户端紧接着发送 `StartSession`（`BuildStartSessionToPb` @ `0x1002922f8`），无需等待 `TaskStarted` 返回即可流水线发送：
+### 5.2 Step 2: `StartSession` (`BuildStartSessionToPb` @ `0x1002922f8`)
+Can be pipelined immediately after `StartTask` without waiting for `TaskStarted` (`SendStartProtocol` @ `0x100291384`):
 - `appkey`: `"OrnqKvSSrs"`
 - `namespace`: `"ASR"`
 - `event`: `"StartSession"`
-- `task_id`: `<同一个32位hex UUID>`
-- `payload`: JSON 字符串，结构如下（由 `AsrOnWorker::Init` @ `0x10028b5fc` 与 `Extra.encode(to:)` @ `0x100b371a4` 构造）：
+- `task_id`: `<same 32-char hex UUID>`
+- `payload`: JSON string:
 
 ```json
 {
@@ -164,7 +209,7 @@ WebSocket 连接建立后，客户端首先发送 `StartTask`（`BuildStartTaskT
     "app_version": "1.0.2",
     "cell_compress_rate": 8,
     "device_brand": "Apple",
-    "device_id": "2451255482369287",
+    "device_id": "7391846205183947",
     "device_model": "Mac",
     "disable_user_words": false,
     "enable_asr_format": true,
@@ -190,38 +235,28 @@ WebSocket 连接建立后，客户端首先发送 `StartTask`（`BuildStartTaskT
 }
 ```
 
-> **关于 `audio_info.format`**：
-> - `"pcm"`：直接发送 16kHz、单声道、16-bit Signed LE 裸 PCM 数据，无需任何音频编码库。
-> - `"speech_opus"`：使用 `libopus`（16kHz, 单声道, `OPUS_APPLICATION_AUDIO`, CBR 32kbps, 20ms 帧）编码。
-
-服务端返回 `WebSocketResponse`：
-- `event`: `"SessionStarted"`
-- `status_code`: `20000000`
-
-### 4.3 阶段三：流式发送音频块 (`TaskRequest`)
-
-每采集满 `3200` 字节（100ms 16kHz 16-bit 单声道 PCM），发送一帧 `TaskRequest`（`BuildAudioDataToPb` @ `0x100292ca8`）：
+### 5.3 Step 3: `TaskRequest` Audio Chunks (`BuildAudioDataToPb` @ `0x100292ca8`)
+For each 100 ms (`3,200` bytes) of 16 kHz, 16-bit mono signed LE PCM:
 - `appkey`: `"OrnqKvSSrs"`
 - `namespace`: `"ASR"`
 - `event`: `"TaskRequest"`
-- `task_id`: `<同一个32位hex UUID>`
-- `seq_id`: `1, 2, 3, ...`（从 1 递增）
-- `payload`: `{"timestamp_ms": 1761508500123}`（当前毫秒级 Unix 时间戳）
-- `data`: `3200` 字节音频数据
+- `task_id`: `<same 32-char hex UUID>`
+- `seq_id`: `1, 2, 3, ...`
+- `payload`: `{"timestamp_ms": 1761508500123}`
+- `data`: Raw 3,200-byte PCM chunk
 
-### 4.4 阶段四：实时接收识别结果 (`event == ""`)
+### 5.4 Step 4: Receiving Recognition Results (`WebSocketResponse` with `event == ""`)
 
-音频发送过程中，服务端持续推送 `event == ""`、`status_code == 20000000` 的 `WebSocketResponse`，其 `payload` JSON 有三类：
-
-1. **VAD 触发通知**：
+1. **VAD Start Notification**:
    ```json
    {
      "results": [{"text": "", "is_interim": true}],
      "extra": {"vad_start": true}
    }
    ```
-2. **流式中间结果 (`is_interim: true`)**：
-   `results[0]` 为实时带标点/ITN 的预览文本，`results[1]` 为不带标点的原始流式文本：
+2. **Streaming Partial Result (`is_interim: true`)**:
+   - `results[0].text`: Punctuated and ITN-formatted text for live UI display.
+   - `results[1].text`: Raw unpunctuated streaming text.
    ```json
    {
      "results": [
@@ -243,8 +278,8 @@ WebSocket 连接建立后，客户端首先发送 `StartTask`（`BuildStartTaskT
      "extra": {"seq_id": 41}
    }
    ```
-3. **最终重打分结果 (`is_interim: false, is_vad_finished: true`)**：
-   在客户端发送 `FinishSession` 后返回，包含 Three-Pass 大模型修正后的最终文本与耗时统计：
+3. **Final Rescored Result (`is_interim: false, is_vad_finished: true`)**:
+   Returned ~250–320 ms after `FinishSession`:
    ```json
    {
      "results": [
@@ -273,47 +308,42 @@ WebSocket 连接建立后，客户端首先发送 `StartTask`（`BuildStartTaskT
    }
    ```
 
-### 4.5 阶段五：结束会话与任务 (`FinishSession` -> `SessionFinished` -> `FinishTask`)
-
-1. 用户停止说话后，客户端将剩余不足 3200 字节的尾帧作为最后一个 `TaskRequest` 发出，随后发送 `FinishSession`（`BuildFinishSessionToPb` @ `0x100292780`）：
-   - `appkey`: `"OrnqKvSSrs"`
-   - `namespace`: `"ASR"`
-   - `event`: `"FinishSession"`
-   - `task_id`: `<同一个32位hex UUID>`
-2. 服务端返回最终识别结果帧（`is_interim: false, is_vad_finished: true`），随后返回 `event == "SessionFinished"`。
-3. 客户端收到 `SessionFinished` 后，发送 `FinishTask`（`BuildFinishTaskToPb` @ `0x100292a14`）并关闭连接。
+### 5.5 Step 5: `FinishSession` & `FinishTask`
+1. Flush any remaining PCM bytes (`< 3200` bytes) in a final `TaskRequest`, then send `FinishSession` (`event = "FinishSession"`).
+2. Wait for the final `WebSocketResponse` (`is_interim: false`) and `WebSocketResponse(event = "SessionFinished")`.
+3. Send `FinishTask` (`event = "FinishTask"`) and close the WebSocket.
 
 ---
 
-## 5. 逆向证据索引 (REA Evidence & Ghidra 函数表)
+## 6. Reverse-Engineering Evidence Ledger (REA & Ghidra)
 
-| 目标文件 | SHA-256 | REA Evidence ID | 说明 |
+| Artifact | SHA-256 | REA Evidence ID | Role |
 |---|---|---|---|
-| `/Library/Input Methods/DoubaoIme.app/Contents/MacOS/DoubaoIme` | `4b3836dcb8a3e06b01b4c95390c757b71f623c1f7c4141c059e49284f7f6442d` | `ev_145a49b5f55a04af7b188cffa81e1edf0da537a3bf9f020e110580dae0754e20` | 主程序通用二进制 Mach-O 结构与导入符号 |
-| `/Library/Input Methods/DoubaoIme.app` | `4b3836dcb8a3e06b01b4c95390c757b71f623c1f7c4141c059e49284f7f6442d` | `ev_60e311381b34a601a05789a0730c70e1ece8d9d0210d5f968035341f31e02512` | Bundle `@rpath` 动态库依赖图 |
-| `DoubaoIme.arm64` (arm64 slice) | `266f49f6bcb62e43c5170620d4b86e2e4c4ef873bcce624ef1a90b9c46244983` | `ev_356efd780d3b339ee6da9b6f354b5d31aebf42fce0e503ceee1c0759c436b2cc` | Ghidra 反编译基准 (`__TEXT` @ `0x100000000`) |
-| `OimeCommon.framework/Versions/A/OimeCommon` | `fb6d9f1d0d5e6935455779fb3bc6bf53d95fd0d0f32c37c5bb65ef5bd83ce8e4` | `ev_c46b8e4f13b60e2bbb91b4c0990b7e9fea07d32e01fc27df94feeac9933711ec` | `AppInfo` 与 `DeviceInfo` 实现 |
+| `/Library/Input Methods/DoubaoIme.app/Contents/MacOS/DoubaoIme` | `4b3836dcb8a3e06b01b4c95390c757b71f623c1f7c4141c059e49284f7f6442d` | `ev_145a49b5f55a04af7b188cffa81e1edf0da537a3bf9f020e110580dae0754e20` | Universal Mach-O layout, imports, exports |
+| `/Library/Input Methods/DoubaoIme.app` | `4b3836dcb8a3e06b01b4c95390c757b71f623c1f7c4141c059e49284f7f6442d` | `ev_60e311381b34a601a05789a0730c70e1ece8d9d0210d5f968035341f31e02512` | Bundle `@rpath` dylib dependency graph |
+| `DoubaoIme.arm64` (thinned arm64) | `266f49f6bcb62e43c5170620d4b86e2e4c4ef873bcce624ef1a90b9c46244983` | `ev_356efd780d3b339ee6da9b6f354b5d31aebf42fce0e503ceee1c0759c436b2cc` | Ghidra decompilation image (`__TEXT` @ `0x100000000`) |
+| `OimeCommon.framework/Versions/A/OimeCommon` | `fb6d9f1d0d5e6935455779fb3bc6bf53d95fd0d0f32c37c5bb65ef5bd83ce8e4` | `ev_c46b8e4f13b60e2bbb91b4c0990b7e9fea07d32e01fc27df94feeac9933711ec` | `AppInfo` (`aid=685343`) & `DeviceInfo.commonParams` |
 
-### 关键函数地址对照表 (`DoubaoIme.arm64`)
+### Key Decompiled Procedures (`DoubaoIme.arm64`)
 
-| 地址 | 符号 / 所属模块 | 作用 |
+| Address | Symbol / Source File | Description |
 |---|---|---|
-| `0x100b31b5c` | `SAMIHandle.swift` | 初始化连接池与基础参数（`appKey = "OrnqKvSSrs"`, `businessInfo = "wave"`） |
-| `0x100b3913c` | `SAMIHandle.swift` | 创建 `SAMICore_AsrContextCreateParameterV2` 并启动 `SAMICore` 句柄 |
-| `0x100b22870` | `Header.encode(to:)` | 编码 `proto-version`、`sdk-version`、`x-tt-token`、`x-tt-e-k` |
-| `0x100b22de4` | `OdinToken.encode(to:)` | 编码 `device_id`、`aid` |
-| `0x100b371a4` | `Extra.encode(to:)` | 编码 `StartSession` 的 32 个 `extra` 字段 |
-| `0x10028b5fc` | `AsrOnWorker::Init` (`asr_on_worker.cpp`) | 解析参数并构建 `StartSession` payload JSON |
-| `0x10028d7a8` | `AsrOnWorker::SendAudioData` | 音频分帧与队列入队 |
-| `0x10028ea20` | `AsrOnWorker::OnMessage` | 处理服务端 `TaskStarted`、`SessionStarted`、流式结果、`SessionFinished` |
-| `0x100291384` | `AsrOnWorker::SendStartProtocol` | 发送 `StartTask` 与 `StartSession` |
-| `0x10029154c` | `AsrOnWorker::SendFinishProtocol` | 发送 `FinishTask` |
-| `0x100292060` | `BuildStartTaskToPb` (`protocol.cpp`) | 构造 `StartTask` Protobuf 帧 |
-| `0x1002922f8` | `BuildStartSessionToPb` (`protocol.cpp`) | 构造 `StartSession` Protobuf 帧 |
-| `0x100292780` | `BuildFinishSessionToPb` (`protocol.cpp`) | 构造 `FinishSession` Protobuf 帧 |
-| `0x100292a14` | `BuildFinishTaskToPb` (`protocol.cpp`) | 构造 `FinishTask` Protobuf 帧 |
-| `0x100292ca8` | `BuildAudioDataToPb` (`protocol.cpp`) | 构造 `TaskRequest` 音频数据 Protobuf 帧 |
-| `0x100293af4` | `ServiceWrapper::Init` (`service_wrapper.cpp`) | 解析 Header/Query/Token 并初始化 WebSocket 客户端 |
-| `0x10023e22c` | `SAMIWebsocketTTNetClient::init` | 拼接 URL Query 与 Header 并建立 WebSocket 连接 |
-| `0x10098114c` | `WebSocketRequest::SerializeWithCachedSizes` | Protobuf 请求序列化 |
-| `0x1009821d0` | `WebSocketResponse::MergePartialFromCodedStream` | Protobuf 响应反序列化 |
+| `0x100b31b5c` | `SAMIHandle.swift` | Initializes connection pool parameters (`appKey = "OrnqKvSSrs"`, `businessInfo = "wave"`) |
+| `0x100b3913c` | `SAMIHandle.swift` | Populates `SAMICore_AsrContextCreateParameterV2` and creates `SAMICore` handle |
+| `0x100b22870` | `Header.encode(to:)` | Encodes `proto-version`, `sdk-version`, `x-tt-token`, `x-tt-e-k` |
+| `0x100b22de4` | `OdinToken.encode(to:)` | Encodes `device_id` and `aid` |
+| `0x100b371a4` | `Extra.encode(to:)` | Encodes the 32 fields of `StartSession.extra` |
+| `0x10028b5fc` | `AsrOnWorker::Init` (`asr_on_worker.cpp`) | Builds `StartSession` payload JSON; selects `"pcm"` vs `"speech_opus"` |
+| `0x10028d7a8` | `AsrOnWorker::SendAudioData` | Buffers/encodes audio and enqueues chunks into `SendQueue` |
+| `0x10028ea20` | `AsrOnWorker::OnMessage` | Handles `TaskStarted`, `SessionStarted`, streaming JSON results, `SessionFinished` |
+| `0x100291384` | `AsrOnWorker::SendStartProtocol` | Sends `StartTask` followed by `StartSession` |
+| `0x10029154c` | `AsrOnWorker::SendFinishProtocol` | Sends `FinishTask` |
+| `0x100292060` | `BuildStartTaskToPb` (`protocol.cpp`) | Serializes `StartTask` `WebSocketRequest` |
+| `0x1002922f8` | `BuildStartSessionToPb` (`protocol.cpp`) | Serializes `StartSession` `WebSocketRequest` |
+| `0x100292780` | `BuildFinishSessionToPb` (`protocol.cpp`) | Serializes `FinishSession` `WebSocketRequest` |
+| `0x100292a14` | `BuildFinishTaskToPb` (`protocol.cpp`) | Serializes `FinishTask` `WebSocketRequest` |
+| `0x100292ca8` | `BuildAudioDataToPb` (`protocol.cpp`) | Serializes `TaskRequest` audio chunk `WebSocketRequest` |
+| `0x100293af4` | `ServiceWrapper::Init` (`service_wrapper.cpp`) | Splits `OdinToken` (`device_id`, `aid`, `iid`) into URL query and headers; injects `x-custom-keepalive: true` |
+| `0x10023e22c` | `SAMIWebsocketTTNetClient::init` | Builds final WebSocket URL with query parameters and headers |
+| `0x10098114c` | `WebSocketRequest::SerializeWithCachedSizes` | Protobuf serializer for `mammon_internal.WebSocketRequest` |
+| `0x1009821d0` | `WebSocketResponse::MergePartialFromCodedStream` | Protobuf parser for `mammon_internal.WebSocketResponse` |

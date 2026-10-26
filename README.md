@@ -1,37 +1,58 @@
 # Free ASR (`free-asr`)
 
-零第三方依赖的纯 Swift 实时流式语音识别客户端与协议文档，基于豆包输入法 macOS 版（`DoubaoIme.app` v1.0.2）免登录流式 ASR 协议实现。
-
-- **无需登录账号**：使用设备级免登录鉴权（任意 16 位数字 `device_id` + 固定 `aid=685343` + `appkey=OrnqKvSSrs`）。
-- **零外部依赖**：服务端原生支持 `16kHz / 单声道 / 16-bit LE PCM` 直传，无需引入 `libopus` 或 `protobuf` C++ 库，仅依赖系统 `Foundation` 与 `AVFoundation`。
-- **边说边出字 + 多遍重打分**：实时返回带标点的流式中间结果（`partialResult`），停止说话后约 250ms 返回 Two-Pass / Three-Pass 修正后的最终结果（`finalResult`）。
+A zero-dependency, pure-Swift real-time streaming Speech-to-Text (ASR) client and complete protocol specification, reverse-engineered from **Doubao Input Method for macOS** (`DoubaoIme.app` v1.0.2 / ByteDance SAMI Core SDK `mac_14.91.26-alpha.1-oinput`).
 
 ---
 
-## 目录结构
+## Key Findings: How Authentication & Streaming Work
 
-- [`PROTOCOL.md`](./PROTOCOL.md)：完整协议逆向规范（握手 Header/Query、Protobuf 字段定义、状态机、JSON 载荷格式、REA Evidence ID 与 Ghidra 反编译函数地址表）。
-- [`proto/websocket_asr.proto`](./proto/websocket_asr.proto)：还原的 `mammon_internal.WebSocketRequest` / `WebSocketResponse` Protobuf schema。
-- [`Sources/DoubaoASR/DoubaoASRClient.swift`](./Sources/DoubaoASR/DoubaoASRClient.swift)：核心 Swift SDK（`DoubaoASRSession` 流式会话 + `DoubaoMicrophoneStreamer` 麦克风采集重采样）。
-- [`Sources/doubao-asr-cli/main.swift`](./Sources/doubao-asr-cli/main.swift)：命令行测试工具。
+1. **No Account Login Required (`tokenType = 1` / `TOKEN_TO_C`)**:
+   Doubao IME works out-of-the-box without signing into a Doubao account.
+2. **No Device Registration Required (`device_id` is not checked against a whitelist)**:
+   While the official app asynchronously registers a `device_id` via `libapplogrs.dylib` (cached in `~/Library/Application Support/DoubaoIme/AppLog/keyboard/applog.cache2`), the ASR WebSocket gateway (`wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws`) **does not verify whether `device_id` exists in a backend database**.
+   - Why? Input methods must respond immediately on first keystroke right after installation, even before background device registration finishes.
+   - Any randomly generated 16-digit numeric string (e.g., `7391846205183947`) is accepted immediately with `status_code = 20000000 (OK)`. The server only uses `device_id` for rate-limiting buckets and log tracing (`log_id`).
+3. **What the Server Actually Validates**:
+   The gateway only checks three hardcoded constants:
+   - **URL Query**: `aid=685343` (Doubao IME macOS App ID) and a non-empty `device_id=<16-digit number>`.
+   - **WebSocket HTTP Headers**: `proto-version: v2`, `sdk-version: 2`, `x-tt-e-k: <device_id>+W`, `x-custom-keepalive: true`, and `x-tt-token: ""` (empty string).
+   - **Protobuf Frame Fields**: `appkey = "OrnqKvSSrs"` (field 2) and `namespace = "ASR"` (field 3) in every `WebSocketRequest` frame.
+4. **Native Uncompressed PCM Support (No `libopus` or `protobuf` C++ libraries needed)**:
+   Although the official app defaults to `"format": "speech_opus"`, decompilation of `AsrOnWorker::Init` (`0x10028b5fc`) revealed that setting `"format": "pcm"` in the `StartSession` JSON payload makes the server accept **raw 16,000 Hz, 1-channel (mono), 16-bit signed little-endian PCM** (`3,200` bytes per 100 ms chunk).
+5. **Streaming Partial + Three-Pass Rescored Final Results**:
+   - While audio chunks are streaming, the server pushes real-time partial results (`is_interim: true`), including both punctuated/ITN text (`results[0].text`) and raw unpunctuated text (`results[1].text`).
+   - Once `FinishSession` is sent, the server runs a server-side Two-Pass / Three-Pass LLM rescorer and returns the final corrected transcript (`is_interim: false, is_vad_finished: true`) in ~250–320 ms.
 
 ---
 
-## 快速测试
+## Repository Structure
 
-### 1. 用系统语音合成一句话并测试流式识别
+- [`PROTOCOL.md`](./PROTOCOL.md): Complete English protocol specification (authentication mechanics, WebSocket handshake Query & Headers, Protobuf wire schema, session state machine, JSON payloads, REA Evidence IDs, and Ghidra decompiled function table).
+- [`proto/websocket_asr.proto`](./proto/websocket_asr.proto): Recovered Protobuf schema for `mammon_internal.WebSocketRequest` and `mammon_internal.WebSocketResponse`.
+- [`Sources/DoubaoASR/DoubaoASRClient.swift`](./Sources/DoubaoASR/DoubaoASRClient.swift): Self-contained, single-file Swift SDK (`DoubaoASRSession` + `DoubaoMicrophoneStreamer` + inline Protobuf wire codec). Can be copied directly into any macOS or iOS app.
+- [`Sources/doubao-asr-cli/main.swift`](./Sources/doubao-asr-cli/main.swift): Command-line tool for testing live microphone capture, local WAV/PCM files, or macOS TTS (`say`) synthesis.
+
+---
+
+## Quick Start & Testing
+
+### 1. Automated Self-Test (macOS TTS -> Doubao ASR)
+
+Synthesizes a Chinese sentence using macOS `/usr/bin/say` (`LEI16@16000`) and streams it to the live server:
 
 ```sh
 swift run doubao-asr-cli --say "不需要登录账号，我们直接用Swift连上了豆包输入法的流式语音识别接口。"
 ```
 
-### 2. 从 Mac 麦克风实时录音识别（按回车停止，`--paste` 自动写入剪贴板）
+### 2. Live Microphone Streaming (Press Enter to stop)
+
+Records from the default Mac microphone, resamples to 16 kHz mono Int16 PCM on-the-fly, prints live interim transcripts, and optionally copies the final transcript to the clipboard (`--paste`):
 
 ```sh
 swift run doubao-asr-cli --paste
 ```
 
-### 3. 识别本地音频文件（16kHz 16-bit 单声道 WAV/PCM）
+### 3. Transcribe a Local Audio File (16 kHz, 16-bit mono WAV or raw PCM)
 
 ```sh
 swift run doubao-asr-cli --file /path/to/audio.wav
@@ -39,9 +60,9 @@ swift run doubao-asr-cli --file /path/to/audio.wav
 
 ---
 
-## 在 Swift 项目中集成
+## Using in Your Own Swift Project
 
-在 `Package.swift` 中添加依赖，或直接将 [`Sources/DoubaoASR/DoubaoASRClient.swift`](./Sources/DoubaoASR/DoubaoASRClient.swift) 单文件复制到你的项目中：
+Add this repository as a Swift Package dependency or copy [`Sources/DoubaoASR/DoubaoASRClient.swift`](./Sources/DoubaoASR/DoubaoASRClient.swift) directly into your target:
 
 ```swift
 import DoubaoASR
@@ -57,9 +78,9 @@ try mic.start { pcmData in
 for try await event in events {
     switch event {
     case let .partialResult(text, _, _):
-        print("实时预览:", text)
+        print("Partial:", text)
     case let .finalResult(text, latencyMs, _):
-        print("最终结果:", text, "耗时: \(latencyMs ?? 0)ms")
+        print("Final:", text, "(\(latencyMs ?? 0) ms)")
     default:
         break
     }

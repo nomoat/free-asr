@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package mammon_internal;
+
+// Recovered from /Users/b415ug3vy19aphsc/19619/sami_core/common_util/protobuf/WebSocketRequest.pb.cc
+// SerializeWithCachedSizes @ 0x10098114c in DoubaoIme (v1.0.2 arm64)
+message WebSocketRequest {
+  string token = 1;       // Empty ("") when tokenType == 1 (TOKEN_TO_C)
+  string appkey = 2;      // "OrnqKvSSrs"
+  string namespace = 3;   // "ASR"
+  string version = 4;     // ""
+  string event = 5;       // "StartTask" | "StartSession" | "TaskRequest" | "FinishSession" | "FinishTask"
+  string payload = 6;     // JSON string (StartSession config or TaskRequest metadata)
+  bytes  data = 7;        // Raw audio frame bytes (PCM 16kHz 16-bit mono LE or Opus) when event == "TaskRequest"
+  string task_id = 8;     // 32-char lowercase hex UUID per session
+  uint64 seq_id = 9;      // 1-based incrementing audio chunk sequence number when event == "TaskRequest"
+  string session_id = 10; // Optional session identifier
+}
+
+// Recovered from /Users/b415ug3vy19aphsc/19619/sami_core/common_util/protobuf/WebSocketResponse.pb.cc
+// MergePartialFromCodedStream @ 0x1009821d0 in DoubaoIme (v1.0.2 arm64)
+message WebSocketResponse {
+  string task_id = 1;
+  string message_id = 2;
+  string namespace = 3;   // "ASR"
+  string event = 4;       // "TaskStarted" | "SessionStarted" | "" (ASR result) | "SessionFinished" | "TaskFinished" | "SessionFailed" | "TaskFailed"
+  int32  status_code = 5; // 20000000 == OK
+  string status_text = 6; // "OK"
+  string payload = 7;     // JSON string containing {"results": [...], "extra": {...}}
+  bytes  data = 8;
+  uint64 seq_id = 9;
+  string session_id = 10;
+}

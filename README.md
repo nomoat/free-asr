@@ -1,88 +1,136 @@
 # Free ASR (`free-asr`)
 
-A zero-dependency, pure-Swift real-time streaming Speech-to-Text (ASR) client and complete protocol specification, reverse-engineered from **Doubao Input Method for macOS** (`DoubaoIme.app` v1.0.2 / ByteDance SAMI Core SDK `mac_14.91.26-alpha.1-oinput`).
+Zero-dependency, login-free real-time streaming Speech-to-Text (ASR) SDKs and CLIs in **Swift**, **Rust**, **Python**, and **TypeScript**, reverse-engineered from **Doubao Input Method** (`DoubaoIme.app` v1.0.2) and **WeChat Input Method / WeType** (`WeType.app` v3.0.0) on macOS.
 
 ---
 
-## Key Findings: How Authentication & Streaming Work
+## Supported Providers Comparison
 
-1. **No Account Login Required (`tokenType = 1` / `TOKEN_TO_C`)**:
-   Doubao IME works out-of-the-box without signing into a Doubao account.
-2. **No Device Registration Required (`device_id` is not checked against a whitelist)**:
-   While the official app asynchronously registers a `device_id` via `libapplogrs.dylib` (cached in `~/Library/Application Support/DoubaoIme/AppLog/keyboard/applog.cache2`), the ASR WebSocket gateway (`wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws`) **does not verify whether `device_id` exists in a backend database**.
-   - Why? Input methods must respond immediately on first keystroke right after installation, even before background device registration finishes.
-   - Any randomly generated 16-digit numeric string (e.g., `7391846205183947`) is accepted immediately with `status_code = 20000000 (OK)`. The server only uses `device_id` for rate-limiting buckets and log tracing (`log_id`).
-3. **What the Server Actually Validates**:
-   The gateway only checks three hardcoded constants:
-   - **URL Query**: `aid=685343` (Doubao IME macOS App ID) and a non-empty `device_id=<16-digit number>`.
-   - **WebSocket HTTP Headers**: `proto-version: v2`, `sdk-version: 2`, `x-tt-e-k: <device_id>+W`, `x-custom-keepalive: true`, and `x-tt-token: ""` (empty string).
-   - **Protobuf Frame Fields**: `appkey = "OrnqKvSSrs"` (field 2) and `namespace = "ASR"` (field 3) in every `WebSocketRequest` frame.
-4. **Native Uncompressed PCM Support (No `libopus` or `protobuf` C++ libraries needed)**:
-   Although the official app defaults to `"format": "speech_opus"`, decompilation of `AsrOnWorker::Init` (`0x10028b5fc`) revealed that setting `"format": "pcm"` in the `StartSession` JSON payload makes the server accept **raw 16,000 Hz, 1-channel (mono), 16-bit signed little-endian PCM** (`3,200` bytes per 100 ms chunk).
-5. **Streaming Partial + Three-Pass Rescored Final Results**:
-   - While audio chunks are streaming, the server pushes real-time partial results (`is_interim: true`), including both punctuated/ITN text (`results[0].text`) and raw unpunctuated text (`results[1].text`).
-   - Once `FinishSession` is sent, the server runs a server-side Two-Pass / Three-Pass LLM rescorer and returns the final corrected transcript (`is_interim: false, is_vad_finished: true`) in ~250–320 ms.
+| Feature | Doubao IME (`doubao`) | WeChat IME / WeType (`wetype`) |
+|---|---|---|
+| **Gateway Endpoint** | `wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws` | `wss://wetype.weixin.qq.com/` (`Sec-WebSocket-Protocol: wxws_pb`) |
+| **Account Login Needed?** | **No** (`tokenType = 1` / `TOKEN_TO_C`) | **No** (anonymous 64-bit `Kb-Uin` issued via `/gen_uin_v2`) |
+| **Bootstrap / Auth** | Random 16-digit `device_id`, `aid=685343`, `appkey="OrnqKvSSrs"` | `secp128r1` ECDH (`/oauth_pubkey_v2`) + `Kb-Sign` SHA-256 (`zN7rB3bL4pO8jW1o`) |
+| **Payload Encryption** | TLS only (plaintext Protobuf + JSON) | Snappy (`>= 301 B`) + AES-256-ECB (session key = 32-char hex of ECDH `S.x`) |
+| **Wire Audio Format** | Raw 16,000 Hz, 1-ch, 16-bit LE PCM (`"format": "pcm"`) | `#!OPUS_RAW_V1\x02\x01\x00` + `[uint16_le(len) + 20ms_opus_64kbps]*` |
+| **Final Rescoring** | Server-side Two-Pass / Three-Pass LLM rescoring (`is_interim: false`) | Server-side Phase-B polish polling (`seq=0, is_end=1` -> `result_text_v2`) |
 
 ---
 
 ## Repository Structure
 
-- [`PROTOCOL.md`](./PROTOCOL.md): Complete English protocol specification (authentication mechanics, WebSocket handshake Query & Headers, Protobuf wire schema, session state machine, JSON payloads, REA Evidence IDs, and Ghidra decompiled function table).
-- [`proto/websocket_asr.proto`](./proto/websocket_asr.proto): Recovered Protobuf schema for `mammon_internal.WebSocketRequest` and `mammon_internal.WebSocketResponse`.
-- [`Sources/DoubaoASR/DoubaoASRClient.swift`](./Sources/DoubaoASR/DoubaoASRClient.swift): Self-contained, single-file Swift SDK (`DoubaoASRSession` + `DoubaoMicrophoneStreamer` + inline Protobuf wire codec). Can be copied directly into any macOS or iOS app.
-- [`Sources/doubao-asr-cli/main.swift`](./Sources/doubao-asr-cli/main.swift): Command-line tool for testing live microphone capture, local WAV/PCM files, or macOS TTS (`say`) synthesis.
+- [`PROTOCOL.md`](./PROTOCOL.md): Complete protocol specification for both **Part I: Doubao IME** and **Part II: WeChat Input Method (WeType)** (authentication, `secp128r1` ECDH, `Kb-Sign` SHA-256 formulas, `#!OPUS_RAW_V1` framing, Protobuf schemas, and decompiled binary function tables).
+- **Protobuf Schemas**:
+  - [`proto/websocket_asr.proto`](./proto/websocket_asr.proto): Doubao IME (`mammon_internal.WebSocketRequest` / `WebSocketResponse`).
+  - [`proto/wetype_asr.proto`](./proto/wetype_asr.proto): WeType (`websocket.*`, `wetap.net.*`, `wetype.voice.*`).
+- **Swift SDK & CLI** (`Package.swift`, zero external dependencies):
+  - [`Sources/DoubaoASR/DoubaoASRClient.swift`](./Sources/DoubaoASR/DoubaoASRClient.swift) & [`Sources/doubao-asr-cli/main.swift`](./Sources/doubao-asr-cli/main.swift)
+  - [`Sources/WeTypeASR/WeTypeASRClient.swift`](./Sources/WeTypeASR/WeTypeASRClient.swift) & [`Sources/wetype-asr-cli/main.swift`](./Sources/wetype-asr-cli/main.swift)
+- **Rust SDK & CLI** (`rust/Cargo.toml`, zero crates.io dependencies):
+  - [`rust/src/lib.rs`](./rust/src/lib.rs) & [`rust/src/main.rs`](./rust/src/main.rs)
+- **Python SDK & CLI** (zero `pip` dependencies):
+  - [`python/free_asr.py`](./python/free_asr.py)
+- **TypeScript SDK & CLI** (`typescript/package.json`, zero `npm` dependencies):
+  - [`typescript/free_asr.ts`](./typescript/free_asr.ts)
 
 ---
 
-## Quick Start & Testing
+## Quick Start Across All 4 Languages
 
-### 1. Automated Self-Test (macOS TTS -> Doubao ASR)
-
-Synthesizes a Chinese sentence using macOS `/usr/bin/say` (`LEI16@16000`) and streams it to the live server:
+### 1. Swift (`doubao-asr-cli` & `wetype-asr-cli`)
 
 ```sh
-swift run doubao-asr-cli --say "不需要登录账号，我们直接用Swift连上了豆包输入法的流式语音识别接口。"
-```
+# Automated TTS -> ASR test (WeType & Doubao)
+swift run wetype-asr-cli --say "不需要登录账号，我们直接用纯Swift连上了微信输入法的流式语音识别服务。"
+swift run doubao-asr-cli --say "不需要登录账号，我们直接用纯Swift连上了豆包输入法的流式语音识别接口。"
 
-### 2. Live Microphone Streaming (Press Enter to stop)
-
-Records from the default Mac microphone, resamples to 16 kHz mono Int16 PCM on-the-fly, prints live interim transcripts, and optionally copies the final transcript to the clipboard (`--paste`):
-
-```sh
+# Live microphone streaming (press Enter to stop; --paste copies to clipboard)
+swift run wetype-asr-cli --paste
 swift run doubao-asr-cli --paste
-```
 
-### 3. Transcribe a Local Audio File (16 kHz, 16-bit mono WAV or raw PCM)
-
-```sh
+# Transcribe a local WAV/PCM file
+swift run wetype-asr-cli --file /path/to/audio.wav
 swift run doubao-asr-cli --file /path/to/audio.wav
 ```
 
+### 2. Rust (`rust/`, zero crates.io dependencies)
+
+```sh
+cd rust
+cargo run -- --provider wetype --say "Rust客户端测试微信输入法语音识别。" --stream
+cargo run -- --provider doubao --say "Rust客户端测试豆包输入法语音识别。" --stream
+cargo run -- --provider wetype --file /path/to/audio.wav
+```
+
+### 3. Python (`python/free_asr.py`, zero `pip` dependencies)
+
+```sh
+python3 python/free_asr.py --provider wetype --say "Python客户端测试微信输入法语音识别。" --stream
+python3 python/free_asr.py --provider doubao --say "Python客户端测试豆包输入法语音识别。" --stream
+python3 python/free_asr.py --provider wetype --file /path/to/audio.wav
+```
+
+### 4. TypeScript (`typescript/free_asr.ts`, zero `npm` dependencies, Node.js 22.6+ / Bun)
+
+```sh
+node typescript/free_asr.ts --provider wetype --say "TypeScript客户端测试微信输入法语音识别。" --stream
+node typescript/free_asr.ts --provider doubao --say "TypeScript客户端测试豆包输入法语音识别。" --stream
+node typescript/free_asr.ts --provider wetype --file /path/to/audio.wav
+```
+
 ---
 
-## Using in Your Own Swift Project
+## SDK Usage Examples
 
-Add this repository as a Swift Package dependency or copy [`Sources/DoubaoASR/DoubaoASRClient.swift`](./Sources/DoubaoASR/DoubaoASRClient.swift) directly into your target:
+### Swift (`DoubaoASR` / `WeTypeASR`)
 
 ```swift
-import DoubaoASR
+import WeTypeASR
 
-let session = DoubaoASRSession()
+let session = WeTypeASRSession()
 let events = try session.start()
+try await session.bootstrapIfNeeded()
 
-let mic = DoubaoMicrophoneStreamer()
+let mic = WeTypeMicrophoneStreamer()
 try mic.start { pcmData in
-    session.sendPCM(pcmData)
+    Task { try? await session.sendPCM(pcmData) }
 }
 
 for try await event in events {
     switch event {
-    case let .partialResult(text, _, _):
+    case let .partialResult(text, _):
         print("Partial:", text)
-    case let .finalResult(text, latencyMs, _):
-        print("Final:", text, "(\(latencyMs ?? 0) ms)")
+    case let .finalResult(text, _):
+        print("Final:", text)
     default:
         break
     }
 }
+```
+
+### Rust (`free_asr`)
+
+```rust
+use free_asr::{transcribe, Provider};
+
+let text = transcribe(&pcm_16k_s16le_bytes, Provider::WeType, None)?;
+println!("Transcript: {}", text);
+```
+
+### Python (`free_asr`)
+
+```python
+from python.free_asr import transcribe
+
+text = transcribe(pcm_16k_s16le_bytes, provider="wetype")
+print("Transcript:", text)
+```
+
+### TypeScript (`free_asr.ts`)
+
+```ts
+import { transcribe } from "./typescript/free_asr.ts";
+
+const text = await transcribe(pcm16kS16leBuffer, "wetype");
+console.log("Transcript:", text);
 ```

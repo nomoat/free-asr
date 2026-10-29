@@ -1,0 +1,13 @@
+{
+  "name": "free-asr",
+  "version": "1.0.0",
+  "description": "Zero-dependency TypeScript SDK & CLI for Doubao IME and WeChat WeType IME streaming ASR",
+  "type": "module",
+  "main": "./free_asr.ts",
+  "bin": {
+    "free-asr": "./free_asr.ts"
+  },
+  "scripts": {
+    "start": "node ./free_asr.ts"
+  }
+}

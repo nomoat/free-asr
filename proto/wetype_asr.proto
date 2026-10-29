@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+// ============================================================================
+// 1. WebSocket Tunnel Framing (package websocket)
+//    Used over wss://wetype.weixin.qq.com with Sec-WebSocket-Protocol: wxws_pb
+// ============================================================================
+
+message HttpHeader {
+  string key   = 1; // Tag 0x0a
+  string value = 2; // Tag 0x12
+}
+
+// Decompiled from wetap::net::WcwssAPI::GETWsHttpData @ 0x1015f498c
+message HttpRequest {
+  string              method = 1; // Tag 0x0a: "POST"
+  string              path   = 3; // Tag 0x1a: "/oauth_pubkey_v2" | "/gen_uin_v2" | "/api_v2" | "/timestamp"
+  string              query  = 4; // Tag 0x22: ""
+  repeated HttpHeader header = 5; // Tag 0x2a: Kb-* and HTTP headers
+  bytes               body   = 6; // Tag 0x32: Encrypted (and optionally Snappy-compressed) task payload
+}
+
+// Decompiled from websocket::WebSocketPbRequest::WebSocketPbRequest @ 0x10160a99c
+message WebSocketPbRequest {
+  uint32      field_1  = 1; // Tag 0x08: 0
+  uint32      field_2  = 2; // Tag 0x10: 0
+  uint32      seq      = 3; // Tag 0x18: Matches Kb-TaskId (e.g. 2147483646 for DH, 2147483645 for GenUin, 1..N for tasks)
+  HttpRequest http_req = 5; // Tag 0x2a
+}
+
+// Decompiled from websocket::HttpResponse::_InternalSerialize @ 0x10160bfe8
+message HttpResponse {
+  string              version     = 1; // Tag 0x0a
+  int32               status_code = 2; // Tag 0x10: 200 (or 5004 / 5011 when session key expired)
+  string              status_text = 3; // Tag 0x1a
+  repeated HttpHeader header      = 4; // Tag 0x22: e.g. kb-compressiontype ("1"=none, "2"=snappy)
+  bytes               body        = 5; // Tag 0x2a: AES-256-ECB encrypted response payload
+}
+
+// Decompiled from websocket::WebSocketPbResponse::_InternalSerialize @ 0x10160ced0
+message WebSocketPbResponse {
+  uint32       type      = 1; // Tag 0x08
+  uint32       seq       = 2; // Tag 0x10: Matches request seq (0 for server push notifications)
+  bytes        push_data = 3; // Tag 0x1a: Populated when seq == 0
+  HttpResponse http_rsp  = 4; // Tag 0x22: Populated when seq != 0
+}
+
+// ============================================================================
+// 2. Session Bootstrap & Anonymous UIN Handshake (package wetap.net)
+// ============================================================================
+
+// POST /oauth_pubkey_v2 (TaskId = 2147483646 / 0x7ffffffe)
+// Encrypted with static key "D4Y5U3Y2M0C0T7N4P1P7O2N6E1I2Y1U6" (AES-256-ECB, PKCS#7, no Snappy)
+// Decompiled from wetap::net::ECDHPubKeyReq_V2::_InternalSerialize @ 0x101606124
+message ECDHPubKeyReq_V2 {
+  string client_pub_key    = 1; // Tag 0x0a: 66-char uppercase hex of uncompressed secp128r1 point ("04" + X_32hex + Y_32hex)
+  string last_svr_pub_key  = 2; // Tag 0x12: "" on initial handshake
+  uint32 need_get_uin      = 3; // Tag 0x18: 1 when requesting a new anonymous UIN, 0 when refreshing AES key for existing UIN
+  string device_code       = 4; // Tag 0x22: 64-char device code ("MAC" + model.rjust(17,'0') + rand12 + MD5_UPPER(prefix32 + sign_key))
+  uint64 uin               = 5; // Tag 0x28: Existing UIN when need_get_uin == 0
+  string saved_uin_token   = 6; // Tag 0x32: Optional cached token
+  string device_token      = 7; // Tag 0x3a: ""
+  string device_name       = 8; // Tag 0x42: e.g. "Mac17,8"
+  string user_device_name  = 9; // Tag 0x4a: ""
+}
+
+// Response from /oauth_pubkey_v2 (decrypted with static key "D4Y5U3Y2M0C0T7N4P1P7O2N6E1I2Y1U6")
+// Decompiled from wetap::net::CronetNetworkApi::GetSvrPublicKey::$_0 @ 0x1015e544c
+message ECDHPubKeyRsp_V2 {
+  int32  ret           = 1; // Tag 0x08: 0 = OK
+  string svr_pub_key   = 2; // Tag 0x12: 66-char uppercase hex of server's uncompressed secp128r1 point ("04" + X_32hex + Y_32hex)
+  uint32 expire_sec    = 3; // Tag 0x18: e.g. 600
+  string gen_uin_token = 4; // Tag 0x22: UUID string passed in Kb-GenUinToken header for /gen_uin_v2
+  uint32 has_dismatch  = 5; // Tag 0x28: 0
+}
+
+// POST /gen_uin_v2 (TaskId = 2147483645 / 0x7ffffffd)
+// Encrypted with ECDH-derived session AES key (32-char uppercase hex of secp128r1 shared secret X coordinate)
+// Decompiled from wetap::net::GenUinReq_V2::_InternalSerialize @ 0x101607d08
+message GenUinReq_V2 {
+  string device_code  = 1; // Tag 0x0a: Same 64-char device_code as ECDHPubKeyReq_V2
+  string svr_pub_key  = 2; // Tag 0x12: Server public key returned in ECDHPubKeyRsp_V2.svr_pub_key
+  uint64 uin          = 3; // Tag 0x18: 0 / omitted on fresh UIN allocation
+  string uuid         = 4; // Tag 0x22: 32-char random hex string
+  string device_token = 5; // Tag 0x2a: ""
+}
+
+// Response from /gen_uin_v2 (decrypted with ECDH-derived session AES key)
+// Decompiled from wetap::net::CronetNetworkApi::GetSvrUIN::$_0 @ 0x1015e5ee4
+message GenUinRsp_V2 {
+  int32  ret = 1; // Tag 0x08: 0 = OK
+  uint64 uin = 2; // Tag 0x10: Newly allocated anonymous UIN (e.g. 8848126560705621)
+}
+
+// ============================================================================
+// 3. Streaming Voice ASR Messages (package wetype.voice, Kb-CmdId = 4548)
+// ============================================================================
+
+message BaseResponse {
+  int32 ret = 1; // Tag 0x08: 0 = OK
+  bytes msg = 2; // Tag 0x12
+}
+
+// Outer request wrapper for Kb-CmdId = 4548, Kb-SubCmdId = 0
+// Decompiled from wetype::VoiceEngine::buildVoiceTransRequest @ 0x10004ad90
+message ImeVoiceTranslateReq {
+  bytes req = 1; // Tag 0x0a: Serialized ImeVoiceAssistantReq
+}
+
+// Inner streaming voice request
+message ImeVoiceAssistantReq {
+  string voice_id = 2;  // Tag 0x12: 25-digit random numeric session ID
+  bytes  audio    = 4;  // Tag 0x22: TROpusTool framed Opus stream (first packet prefixed with "#!OPUS_RAW_V1\x02\x01\x00", then [uint16_le(len) + opus_frame]*)
+  uint32 encode   = 5;  // Tag 0x28: 5 (OPUS_RAW_V1, 16kHz mono 64kbps 20ms frames)
+  uint32 is_end   = 6;  // Tag 0x30: 1 on final audio packet and Phase-B polling packets; omitted/0 otherwise
+  uint32 seq      = 7;  // Tag 0x38: 1..N for audio packets; 0 (omitted) for Phase-B polling packets (sendEndPollingRequest)
+  uint32 offset   = 11; // Tag 0x58: Cumulative audio bytes sent so far
+  uint32 lane     = 24; // Tag 0x80 0x01: 1 (live) or 2 (poll)
+}
+
+// Outer response wrapper for Kb-CmdId = 4548
+// Decompiled from wetype::VoiceEngine::parseVoiceTransResponse @ 0x10004c9b4
+message ImeVoiceTranslateResp {
+  bytes rsp = 1; // Tag 0x0a: Serialized ImeVoiceAssistantRsp
+}
+
+// Inner streaming voice response
+message ImeVoiceAssistantRsp {
+  BaseResponse base_resp              = 1;   // Tag 0x0a
+  bytes        voice_id               = 2;   // Tag 0x12
+  uint32       result_seq             = 3;   // Tag 0x18
+  string       result_text            = 4;   // Tag 0x22: Streaming ASR transcript
+  uint32       end_flag               = 5;   // Tag 0x28: 1 when final polished transcript is ready
+  uint32       interval_ms            = 6;   // Tag 0x30: Suggested packet/poll interval (100 ms)
+  uint32       frozen_offset          = 11;  // Tag 0x58
+  string       translate_text         = 12;  // Tag 0x62
+  bool         has_aggressive_result  = 13;  // Tag 0x68
+  string       result_text_v2         = 14;  // Tag 0x72: Final Phase-B polished transcript (populated when end_flag == 1)
+  uint32       poll_status            = 16;  // Tag 0x80 0x01: 1 = Phase-B polish ready
+  uint32       aggressive_result_len  = 17;  // Tag 0x88 0x01
+  uint32       ack_seq                = 18;  // Tag 0x90 0x01: Request seq acknowledged
+  uint32       timeout_ms             = 100; // Tag 0xa0 0x06: 3500 ms
+}

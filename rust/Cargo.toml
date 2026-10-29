@@ -1,0 +1,15 @@
+[package]
+name = "free-asr"
+version = "1.0.0"
+edition = "2021"
+description = "Zero-dependency Rust SDK & CLI for Doubao IME and WeChat WeType IME streaming ASR"
+
+[lib]
+name = "free_asr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "free-asr"
+path = "src/main.rs"
+
+[dependencies]

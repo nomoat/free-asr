@@ -1,6 +1,13 @@
-# Doubao IME (macOS v1.0.2) Streaming Speech-to-Text (ASR) Protocol Specification
+# Free ASR: Doubao IME & WeChat Input Method (WeType) Streaming ASR Protocol Specification
 
-This document specifies the complete wire protocol, authentication model, Protobuf framing, and JSON schemas for the unauthenticated real-time streaming Speech-to-Text (ASR) service used by **Doubao Input Method for macOS** (`/Library/Input Methods/DoubaoIme.app`, v1.0.2, embedding ByteDance SAMI Core SDK `mac_14.91.26-alpha.1-oinput`).
+This document specifies the complete wire protocols, authentication/bootstrap models, cryptographic key derivations, Protobuf schemas, and state machines for two login-free real-time streaming Speech-to-Text (ASR) services reverse-engineered on macOS:
+
+- **Part I**: **Doubao Input Method for macOS** (`/Library/Input Methods/DoubaoIme.app` v1.0.2, ByteDance SAMI Core SDK `mac_14.91.26-alpha.1-oinput`)
+- **Part II**: **WeChat Input Method (WeType) for macOS** (`/Library/Input Methods/WeType.app` v3.0.0 (670), Tencent `wetap::net` + `wcwss.framework` + `TROpusTool`)
+
+---
+
+# Part I: Doubao IME (macOS v1.0.2) Streaming ASR Protocol
 
 ---
 
@@ -347,3 +354,204 @@ For each 100 ms (`3,200` bytes) of 16 kHz, 16-bit mono signed LE PCM:
 | `0x10023e22c` | `SAMIWebsocketTTNetClient::init` | Builds final WebSocket URL with query parameters and headers |
 | `0x10098114c` | `WebSocketRequest::SerializeWithCachedSizes` | Protobuf serializer for `mammon_internal.WebSocketRequest` |
 | `0x1009821d0` | `WebSocketResponse::MergePartialFromCodedStream` | Protobuf parser for `mammon_internal.WebSocketResponse` |
+
+---
+
+# Part II: WeChat Input Method / WeType (macOS v3.0.0) Streaming ASR Protocol
+
+Reverse-engineered from `/Library/Input Methods/WeType.app/Contents/MacOS/WeType` v3.0.0 (build 670, arm64).
+
+---
+
+## 7. Architecture Overview (WeType)
+
+```
+[Audio Input: 16,000 Hz, 1 channel (mono), 16-bit Signed Little-Endian PCM]
+        │
+        ▼
+[Opus Framing Layer: TROpusTool @ 0x102c3268c]
+  - Opus Encoder : 16,000 Hz, 1 channel, 64,000 bps, 20 ms frames (320 samples / 640 B PCM)
+  - 1st Packet   : Prefixed with 16-byte header "#!OPUS_RAW_V1\x02\x01\x00"
+  - Frame Prefix : uint16_le(frame_byte_length) + raw_opus_frame
+  - Chunk Size   : 5 frames per packet (100 ms)
+        │
+        ▼
+[Voice Protobuf Layer: wetype.voice (Kb-CmdId = 4548, Kb-SubCmdId = 0)]
+  - Request      : ImeVoiceTranslateReq { 1: bytes(ImeVoiceAssistantReq) }
+  - Response     : ImeVoiceTranslateResp { 1: bytes(ImeVoiceAssistantRsp) }
+        │
+        ▼
+[Compression & Encryption Layer: CronetNetworkApi::StartTaskSync @ 0x1015d8c74]
+  - Compression  : Snappy when plaintext >= 301 bytes (Kb-CompressionType = "2"), else uncompressed ("1")
+  - Cipher       : AES-256-ECB with PKCS#7 padding (no IV)
+  - Session Key  : 32-byte ASCII uppercase hex of the 16-byte secp128r1 ECDH shared secret X coordinate
+        │
+        ▼
+[Transport Layer: WebSocket Tunnel (wss://wetype.weixin.qq.com, Sec-WebSocket-Protocol: wxws_pb) or HTTPS]
+  - Step 1       : POST /oauth_pubkey_v2 (TaskId = 2147483646) -> secp128r1 ECDH key exchange + gen_uin_token
+  - Step 2       : POST /gen_uin_v2      (TaskId = 2147483645) -> Anonymous 64-bit UIN allocation (no login)
+  - Step 3       : POST /api_v2          (Kb-CmdId = 4548)     -> Streaming recognition + Phase-B polish polling
+```
+
+---
+
+## 8. Transport Envelope (`proto/wetype_asr.proto`)
+
+WeType supports two equivalent transports to `wetype.weixin.qq.com` (debug host: `wetype995.weixin.qq.com`):
+
+1. **Multiplexed WebSocket Tunnel (Default in `wcwss_api.cpp`)**:
+   - Endpoint: `wss://wetype.weixin.qq.com/`
+   - Required Handshake Header: `Sec-WebSocket-Protocol: wxws_pb` (`wetap::net::WcwssAPI::ConnectHost` @ `0x1015f7850`)
+   - Binary frames carry `websocket.WebSocketPbRequest` and `websocket.WebSocketPbResponse`:
+
+   ```protobuf
+   message HttpHeader {
+     string key   = 1;
+     string value = 2;
+   }
+
+   message HttpRequest {
+     string              method = 1; // "POST"
+     string              path   = 3; // "/oauth_pubkey_v2" | "/gen_uin_v2" | "/api_v2" | "/timestamp"
+     string              query  = 4; // ""
+     repeated HttpHeader header = 5;
+     bytes               body   = 6;
+   }
+
+   message WebSocketPbRequest {
+     uint32      field_1  = 1; // 0
+     uint32      field_2  = 2; // 0
+     uint32      seq      = 3; // Matches Kb-TaskId
+     HttpRequest http_req = 5;
+   }
+
+   message HttpResponse {
+     string              version     = 1;
+     int32               status_code = 2; // 200 = OK; 5004 / 5011 = session key expired
+     string              status_text = 3;
+     repeated HttpHeader header      = 4; // Includes kb-compressiontype ("1" or "2")
+     bytes               body        = 5;
+   }
+
+   message WebSocketPbResponse {
+     uint32       type      = 1;
+     uint32       seq       = 2; // Matches request seq (0 = server push notification)
+     bytes        push_data = 3;
+     HttpResponse http_rsp  = 4;
+   }
+   ```
+
+2. **Direct HTTPS POST**:
+   - Standard `POST https://wetype.weixin.qq.com/<path>` with the same `Kb-*` HTTP headers and encrypted body.
+
+---
+
+## 9. Platform Constants, Device Code, and `Kb-Sign` Signatures
+
+### 9.1 Platform `sign_key` Table (`0x1015ce944` & `0x1015cfa04`)
+
+| `Kb-OsType` (`platform`) | Prefix | 16-Byte `sign_key` |
+|---|---|---|
+| `1` (Android) | `AND` | `aI0wC6qT1nB3nN5r` |
+| `2` (iOS) | `IOS` | `wC4bY5nV2kE0xK0r` |
+| `3` (Windows) | `WIN` | `mW9oS8mT5eC1xU2i` |
+| `4` (HarmonyOS) | `HAR` | `tF8lN8eP0aO2rB9i` |
+| `5` (macOS) | `MAC` | `zN7rB3bL4pO8jW1o` |
+
+### 9.2 Device Code Generation (`wetap::net::Util::GenerateDeviceCode` @ `0x1015ce7e8`)
+1. Left-pad the device model (e.g., `"Mac17,8"`) with `'0'` to 17 characters (`"0000000000Mac17,8"`).
+2. Generate 12 random lowercase letters `rand12`.
+3. Form the 32-character prefix `prefix32 = "MAC" + padded_model_17 + rand12`.
+4. Append the 32-character uppercase MD5 digest of `prefix32 + "zN7rB3bL4pO8jW1o"`:
+   ```
+   device_code = prefix32 + MD5_UPPER(prefix32 + "zN7rB3bL4pO8jW1o")
+   ```
+
+### 9.3 `Kb-Sign` SHA-256 Formulas (`wetap::net::WcwssAPI::GETWsHttpData` @ `0x1015f498c`)
+
+Every request carries a 64-character uppercase hex SHA-256 signature (`Kb-Sign`):
+
+1. **ECDH Public Key Exchange (`/oauth_pubkey_v2`, `Kb-TaskId = 2147483646`)** (`GetDHAPISignature` @ `0x1015ce178`):
+   ```
+   Kb-Sign = SHA256_UPPER(
+     Kb-OsType + Kb-Version + Kb-Scene + Kb-TimeStamp +
+     Kb-BodyMd5 + Kb-TraceId + Kb-TaskId + "zN7rB3bL4pO8jW1o"
+   )
+   ```
+2. **Anonymous UIN Allocation (`/gen_uin_v2`, `Kb-TaskId = 2147483645`)** (`GetUinAPISignature` @ `0x1015ce37c`):
+   ```
+   Kb-Sign = SHA256_UPPER(
+     Kb-OsType + Kb-Version + Kb-Scene + Kb-TimeStamp +
+     Kb-BodyMd5 + Kb-GenUinToken + Kb-TraceId + Kb-TaskId + "zN7rB3bL4pO8jW1o"
+   )
+   ```
+3. **Standard Task Requests (`/api_v2` and `/timestamp`)** (`GetAPISignature` @ `0x1015cdf08`):
+   ```
+   Kb-Sign = SHA256_UPPER(
+     Kb-OsType + Kb-Version + Kb-Scene + Kb-CmdId + Kb-SubCmdId +
+     Kb-TimeStamp + Kb-BodyMd5 + Kb-Uin + Kb-TraceId + Kb-TaskId + "zN7rB3bL4pO8jW1o"
+   )
+   ```
+
+---
+
+## 10. `secp128r1` ECDH Handshake & AES-256-ECB Key Derivation
+
+### 10.1 Curve Parameters (`CryptoPP::ASN1::secp128r1` @ `0x1015c5a6c`)
+WeType uses **SEC 2 `secp128r1`** (OID `1.3.132.0.28`, 128-bit prime field):
+```
+p  = 0xFFFFFFFDFFFFFFFFFFFFFFFFFFFFFFFF
+a  = 0xFFFFFFFDFFFFFFFFFFFFFFFFFFFFFFFC
+b  = 0xE87579C11079F43DD824993C2CEE5ED3
+Gx = 0x161FF7528B899B2D0C28607CA52C5B86
+Gy = 0xCF5AC8395BAFEB13C02DA292DDED7A83
+n  = 0xFFFFFFFE0000000075A30D1B9038A115
+```
+- **Public Key Format**: Uncompressed SEC 1 point `0x04 || X (16 bytes) || Y (16 bytes)` (33 bytes total), formatted as a **66-character uppercase hex string** (`"04..."`).
+- **Session AES Key Derivation** (`Crypto::ECDHKeyGenerator::GenerateSharedKey` @ `0x1015c5cec`):
+  Given client private scalar `d` and server point `Q_svr`, compute `S = d * Q_svr`. Format the 16-byte X coordinate `S.x` as a **32-character uppercase hex string** (32 ASCII bytes). Those 32 ASCII bytes are used directly as the **AES-256-ECB** key, and its last 4 characters are sent in `Kb-SharedKeySuffix`.
+
+### 10.2 Two-Step Bootstrap
+1. **`POST /oauth_pubkey_v2` (`Kb-TaskId = 2147483646`)**:
+   - `ECDHPubKeyReq_V2` is encrypted with the static 32-byte ASCII key `"D4Y5U3Y2M0C0T7N4P1P7O2N6E1I2Y1U6"` (AES-256-ECB, PKCS#7 padding, `Kb-CompressionType = "1"`).
+   - Response `ECDHPubKeyRsp_V2` is decrypted with `"D4Y5U3Y2M0C0T7N4P1P7O2N6E1I2Y1U6"`, yielding `svr_pub_key` (field 2, 66 hex chars) and `gen_uin_token` (field 4, UUID string).
+2. **`POST /gen_uin_v2` (`Kb-TaskId = 2147483645`)**:
+   - Header includes `Kb-GenUinToken: <gen_uin_token>`.
+   - `GenUinReq_V2` is encrypted with the ECDH-derived session `aes_key`.
+   - Response `GenUinRsp_V2` is decrypted with `aes_key`, yielding the anonymous 64-bit `uin` in field 2.
+
+---
+
+## 11. `#!OPUS_RAW_V1` Audio Framing & Phase-B Polling
+
+### 11.1 `TROpusTool` Framing (`0x102c32738` & `0x102c32ad4`)
+Audio is encoded as 16,000 Hz, 1-channel, 64 kbps Opus in 20 ms frames (320 samples / 640 bytes PCM per frame):
+- **First packet (`seq = 1`)**: Starts with the 16-byte header `"#!OPUS_RAW_V1\x02\x01\x00"` (`0x02` = 16 kHz, `0x01` = 1 channel, `0x00` = reserved).
+- **Every 20 ms Opus frame**: Prefixed by a 2-byte little-endian unsigned length `uint16_le(frame_len)` followed by `frame_len` bytes of raw Opus packet data.
+
+### 11.2 Streaming & Phase-B Polish Polling (`VoiceEngine::sendEndPollingRequest` @ `0x100049300`)
+1. Send audio chunks with `seq = 1..N`, `encode = 5`, `lane = 1`, and cumulative byte `offset`. Set `is_end = 1` on the final audio chunk (`seq = N`).
+2. While `end_flag` (field 5 of `ImeVoiceAssistantRsp`) is `0`, poll every `100 ms` with `voice_id`, `encode = 5`, `is_end = 1`, `seq = 0` (omitted), `offset = total_audio_bytes`, `lane = 1`, and empty `audio`.
+3. When `end_flag == 1`, `result_text_v2` (field 14) and `result_text` (field 4) contain the final punctuated transcript.
+
+### Key Decompiled Procedures (`WeType.arm64`)
+
+| Address | Symbol | Description |
+|---|---|---|
+| `0x100048910` | `wetype::VoiceEngine::setupOpus()` | Initializes 16kHz/Mono/64kbps Opus encoder |
+| `0x100048e4c` | `wetype::VoiceEngine::sendBuffer(bool)` | Sends Opus chunks and `sendEndPollingRequest` (`seq=0, is_end=1`) |
+| `0x10004ad90` | `wetype::VoiceEngine::buildVoiceTransRequest(...)` | Serializes `ImeVoiceTranslateReq` / `ImeVoiceAssistantReq` |
+| `0x10004bbc8` | `wetype::VoiceEngine::handleNetworkResponse(...)` | Processes streaming ASR responses and Phase-B state machine |
+| `0x10004c9b4` | `wetype::VoiceEngine::parseVoiceTransResponse(...)` | Parses `ImeVoiceTranslateResp` / `ImeVoiceAssistantRsp` |
+| `0x1015c5620` | `Crypto::ECDHKeyGenerator::ECDHKeyGenerator()` | Generates `secp128r1` keypair |
+| `0x1015c5a6c` | `CryptoPP::ASN1::secp128r1()` | Returns OID `1.3.132.0.28` (`secp128r1`) |
+| `0x1015c5cec` | `Crypto::ECDHKeyGenerator::GenerateSharedKey(...)` | Computes `secp128r1` shared secret and formats 32-char uppercase hex key |
+| `0x1015c67d0` | `Crypto::AES::Encrypt(...)` / `Decrypt(...)` | AES-256-ECB + PKCS#7 encryption/decryption |
+| `0x1015cdf08` | `wetap::net::Util::GetAPISignature(...)` | Computes `Kb-Sign` for `/api_v2` and `/timestamp` |
+| `0x1015ce178` | `wetap::net::Util::GetDHAPISignature(...)` | Computes `Kb-Sign` for `/oauth_pubkey_v2` |
+| `0x1015ce37c` | `wetap::net::Util::GetUinAPISignature(...)` | Computes `Kb-Sign` for `/gen_uin_v2` |
+| `0x1015ce7e8` | `wetap::net::Util::GenerateDeviceCode(...)` | Generates 64-char `device_code` with platform `sign_key` |
+| `0x1015d8c74` | `wetap::net::CronetNetworkApi::StartTaskSync(...)` | Applies Snappy compression (`>= 301 B`) and AES-256-ECB encryption |
+| `0x1015f498c` | `wetap::net::WcwssAPI::GETWsHttpData(...)` | Builds `WebSocketPbRequest` and `Kb-*` headers |
+| `0x102c32ad4` | `TROpusTool::Encode(...)` | Prepends `#!OPUS_RAW_V1\x02\x01\x00` and 2-byte LE frame lengths |
+

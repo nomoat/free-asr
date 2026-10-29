@@ -1,7 +1,8 @@
 .DS_Store
-/.build
-/Packages
-xcuserdata/
-DerivedData/
+.build/
 .swiftpm/
+rust/target/
+__pycache__/
+*.pyc
+node_modules/
 *.xcodeproj

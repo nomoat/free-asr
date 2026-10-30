@@ -4,6 +4,22 @@ Login-free real-time streaming Speech-to-Text (ASR) SDKs and CLIs in **Swift**, 
 
 ---
 
+## Gemini streaming fallback (verified prototype)
+
+Gemini Live Transcription can serve as a third streaming ASR backend. The opt-in
+[`tests/gemini-stream-smoke.mjs`](./tests/gemini-stream-smoke.mjs) sends 100 ms PCM
+chunks at real-time speed and checks that interim text arrives **before all audio
+has been sent**. It supports automatic VAD and manual push-to-talk boundaries,
+and can test multiple turns over one connection. It uses Node.js built-ins only.
+
+See [`GEMINI_STREAMING.md`](./GEMINI_STREAMING.md) for setup, measured timings,
+protocol details, and integration notes. Credentials are read only from
+`GEMINI_API_KEY` / `GOOGLE_API_KEY`; keep them outside this public repository.
+This is a working protocol reference, not yet a `gemini` provider in the four
+SDKs or an automatic failover implementation.
+
+---
+
 ## Supported Providers Comparison
 
 | Feature | Doubao IME (`doubao`) | WeChat IME / WeType (`wetype`) |

@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 node_modules/
 *.xcodeproj
+.env
+.env.*
+*.env

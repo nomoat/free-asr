@@ -10,9 +10,12 @@ Usage:
     python3 python/free_asr.py --provider doubao --say "今天天气很好，我们去公园散步。"
     python3 python/free_asr.py --provider wetype --file speech.wav --stream
 """
+from __future__ import annotations
+
 import argparse
 import base64
 import ctypes
+import ctypes.util
 import hashlib
 import json
 import os
@@ -393,17 +396,53 @@ def _ec_mul(k: int, pt=(SECP128R1_GX, SECP128R1_GY)):
     return res
 
 
-_cc = ctypes.CDLL("/usr/lib/system/libcommonCrypto.dylib")
-_cc.CCCrypt.argtypes = [
-    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-    ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
-    ctypes.c_void_p, ctypes.c_size_t,
-    ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
-]
-_cc.CCCrypt.restype = ctypes.c_int32
+_cc = None
+if sys.platform == "darwin":
+    _cc = ctypes.CDLL("/usr/lib/system/libcommonCrypto.dylib")
+    _cc.CCCrypt.argtypes = [
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_size_t,
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    _cc.CCCrypt.restype = ctypes.c_int32
+
+
+def _openssl_aes(key_ascii: str, data: bytes, encrypt: bool) -> bytes:
+    """Use system libcrypto; no Python packages or per-request subprocesses."""
+    name = ctypes.util.find_library("crypto")
+    if not name:
+        raise RuntimeError("WeType on Linux requires OpenSSL libcrypto (install libssl3)")
+    lib = ctypes.CDLL(name)
+    ptr = ctypes.c_void_p
+    lib.EVP_CIPHER_CTX_new.restype = ptr
+    lib.EVP_CIPHER_CTX_free.argtypes = [ptr]
+    lib.EVP_aes_256_ecb.restype = ptr
+    lib.EVP_CipherInit_ex.argtypes = [ptr, ptr, ptr, ptr, ptr, ctypes.c_int]
+    lib.EVP_CipherUpdate.argtypes = [ptr, ptr, ctypes.POINTER(ctypes.c_int), ptr, ctypes.c_int]
+    lib.EVP_CipherFinal_ex.argtypes = [ptr, ptr, ctypes.POINTER(ctypes.c_int)]
+    if len(key_ascii) != 32:
+        raise ValueError("AES-256 key must be 32 ASCII bytes")
+    ctx = lib.EVP_CIPHER_CTX_new()
+    if not ctx:
+        raise RuntimeError("OpenSSL context allocation failed")
+    try:
+        out = ctypes.create_string_buffer(len(data) + 32)
+        count, final = ctypes.c_int(), ctypes.c_int()
+        if lib.EVP_CipherInit_ex(ctx, lib.EVP_aes_256_ecb(), None, key_ascii.encode("ascii"), None, int(encrypt)) != 1:
+            raise RuntimeError("OpenSSL AES initialization failed")
+        if lib.EVP_CipherUpdate(ctx, out, ctypes.byref(count), data, len(data)) != 1:
+            raise RuntimeError("OpenSSL AES update failed")
+        if lib.EVP_CipherFinal_ex(ctx, ctypes.byref(out, count.value), ctypes.byref(final)) != 1:
+            raise RuntimeError("OpenSSL AES finalization failed (invalid padding)")
+        return out.raw[:count.value + final.value]
+    finally:
+        lib.EVP_CIPHER_CTX_free(ctx)
 
 
 def _aes256_ecb_enc(key_ascii: str, data: bytes) -> bytes:
+    if _cc is None:
+        return _openssl_aes(key_ascii, data, True)
     key_b = key_ascii.encode("ascii")
     out_cap = len(data) + 32
     out_buf = ctypes.create_string_buffer(out_cap)
@@ -417,6 +456,10 @@ def _aes256_ecb_enc(key_ascii: str, data: bytes) -> bytes:
 def _aes256_ecb_dec(key_ascii: str, data: bytes) -> bytes:
     if not data:
         return b""
+    if len(data) % 16:
+        raise RuntimeError("AES ciphertext must contain complete 16-byte blocks")
+    if _cc is None:
+        return _openssl_aes(key_ascii, data, False)
     key_b = key_ascii.encode("ascii")
     out_cap = len(data) + 32
     out_buf = ctypes.create_string_buffer(out_cap)
@@ -491,8 +534,46 @@ def _snappy_decompress(data: bytes) -> bytes:
     return bytes(out)
 
 
+def _ffmpeg_opus_chunks(pcm: bytes, frames_per_chunk: int) -> list[bytes]:
+    ogg = subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0",
+        "-c:a", "libopus", "-b:a", "64k", "-vbr", "off", "-application", "voip", "-frame_duration", "20", "-f", "opus", "pipe:1",
+    ], input=pcm, capture_output=True, check=True, timeout=60).stdout
+    at, packets, packet = 0, [], bytearray()
+    while at < len(ogg):
+        if at + 27 > len(ogg) or ogg[at:at + 4] != b"OggS":
+            raise ValueError("Invalid Ogg page")
+        count = ogg[at + 26]
+        table, offset = at + 27, at + 27 + count
+        if offset > len(ogg):
+            raise ValueError("Truncated Ogg page")
+        for size in ogg[table:offset]:
+            if offset + size > len(ogg):
+                raise ValueError("Truncated Opus packet")
+            packet.extend(ogg[offset:offset + size])
+            offset += size
+            if size < 255:
+                if packet[:8] not in (b"OpusHead", b"OpusTags"):
+                    packets.append(bytes(packet))
+                packet.clear()
+        at = offset
+    if packet:
+        raise ValueError("Truncated Opus packet")
+    chunks = []
+    for i in range(0, len(packets), frames_per_chunk):
+        header = b"#!OPUS_RAW_V1\x02\x01\x00" if i == 0 else b""
+        chunks.append(header + b"".join(struct.pack("<H", len(p)) + p for p in packets[i:i + frames_per_chunk]))
+    return chunks
+
+
 def encode_wetype_opus_chunks(pcm_bytes: bytes, frames_per_chunk: int = 5) -> list[bytes]:
     """Encodes 16 kHz mono s16le PCM to WeType #!OPUS_RAW_V1 chunks using macOS `/usr/bin/afconvert`."""
+    if frames_per_chunk < 1:
+        raise ValueError("frames_per_chunk must be positive")
+    if not pcm_bytes:
+        return []
+    if sys.platform != "darwin":
+        return _ffmpeg_opus_chunks(pcm_bytes, frames_per_chunk)
     tmp_dir = tempfile.mkdtemp(prefix="wetype-opus-")
     try:
         in_wav = os.path.join(tmp_dir, "in.wav")
@@ -839,12 +920,17 @@ def transcribe(pcm_bytes: bytes, provider: str = "wetype", on_partial: Callable[
 
 
 def load_pcm_16k_mono(path: str) -> bytes:
+    if path.lower().endswith(".pcm"):
+        with open(path, "rb") as f:
+            return f.read()
     try:
         with wave.open(path, "rb") as w:
             if w.getframerate() == 16000 and w.getnchannels() == 1 and w.getsampwidth() == 2:
                 return w.readframes(w.getnframes())
     except wave.Error:
         pass
+    if sys.platform != "darwin":
+        return subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path, "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"], capture_output=True, check=True, timeout=60).stdout
     tmp_dir = tempfile.mkdtemp(prefix="free-asr-")
     try:
         out_wav = os.path.join(tmp_dir, "converted.wav")
@@ -860,6 +946,8 @@ def load_pcm_16k_mono(path: str) -> bytes:
 
 
 def synthesize_tts_pcm(text: str) -> bytes:
+    if sys.platform != "darwin":
+        raise RuntimeError("--say requires macOS; on Linux use --file with a WAV/PCM file")
     tmp_dir = tempfile.mkdtemp(prefix="free-asr-")
     try:
         wav_path = os.path.join(tmp_dir, "speech.wav")

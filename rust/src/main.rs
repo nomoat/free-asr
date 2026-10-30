@@ -18,6 +18,7 @@ fn load_pcm_16k_mono(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn synthesize_tts_pcm(text: &str) -> Result<Vec<u8>, String> {
+    if !cfg!(target_os = "macos") { return Err("--say requires macOS; on Linux use --file with 16 kHz mono WAV/PCM".into()); }
     let tmp = format!("/tmp/free_asr_rs_say_{}.wav", std::process::id());
     let status = Command::new("/usr/bin/say")
         .args(["-v", "Tingting", "-o", &tmp, "--data-format=LEI16@16000", text])

@@ -503,7 +503,42 @@ function snappyDecompress(data: Buffer): Buffer {
   return Buffer.from(out);
 }
 
-function encodeWeTypeOpusChunks(pcm: Buffer, framesPerChunk = 5): Buffer[] {
+export function encodeWeTypeOpusChunks(pcm: Buffer, framesPerChunk = 5): Buffer[] {
+  if (!Number.isInteger(framesPerChunk) || framesPerChunk < 1) throw new Error("framesPerChunk must be positive");
+  if (!pcm.length) return [];
+  if (process.platform !== "darwin") {
+    const ogg = execFileSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0",
+      "-c:a", "libopus", "-b:a", "64k", "-vbr", "off", "-application", "voip", "-frame_duration", "20", "-f", "opus", "pipe:1"],
+      { input: pcm, maxBuffer: Math.max(1024 * 1024, pcm.length), timeout: 60000 });
+    const packets: Buffer[] = [];
+    let at = 0, pieces: Buffer[] = [];
+    while (at < ogg.length) {
+      if (at + 27 > ogg.length || ogg.toString("ascii", at, at + 4) !== "OggS") throw new Error("Invalid Ogg page");
+      const count = ogg[at + 26], table = at + 27;
+      let offset = table + count;
+      if (offset > ogg.length) throw new Error("Truncated Ogg page");
+      for (let i = 0; i < count; i++) {
+        const n = ogg[table + i];
+        if (offset + n > ogg.length) throw new Error("Truncated Opus packet");
+        pieces.push(ogg.subarray(offset, offset + n)); offset += n;
+        if (n < 255) {
+          const packet = Buffer.concat(pieces); pieces = [];
+          if (!["OpusHead", "OpusTags"].includes(packet.toString("ascii", 0, 8))) packets.push(packet);
+        }
+      }
+      at = offset;
+    }
+    if (pieces.length) throw new Error("Truncated Opus packet");
+    const chunks: Buffer[] = [];
+    for (let i = 0; i < packets.length; i += framesPerChunk) {
+      const parts = i ? [] : [Buffer.from("#!OPUS_RAW_V1\x02\x01\x00", "binary")];
+      for (const packet of packets.slice(i, i + framesPerChunk)) {
+        const length = Buffer.alloc(2); length.writeUInt16LE(packet.length); parts.push(length, packet);
+      }
+      chunks.push(Buffer.concat(parts));
+    }
+    return chunks;
+  }
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "wetype-ts-opus-"));
   try {
     const inWav = path.join(tmpDir, "in.wav");
@@ -842,6 +877,7 @@ function loadPcm16kMono(filePath: string): Buffer {
 }
 
 function synthesizeTtsPcm(text: string): Buffer {
+  if (process.platform !== "darwin") throw new Error("--say requires macOS; on Linux use --file with a 16 kHz mono WAV/PCM file");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "free-asr-ts-"));
   try {
     const wavPath = path.join(tmpDir, "speech.wav");

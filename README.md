@@ -1,6 +1,6 @@
 # Free ASR (`free-asr`)
 
-Zero-dependency, login-free real-time streaming Speech-to-Text (ASR) SDKs and CLIs in **Swift**, **Rust**, **Python**, and **TypeScript**, reverse-engineered from **Doubao Input Method** (`DoubaoIme.app` v1.0.2) and **WeChat Input Method / WeType** (`WeType.app` v3.0.0) on macOS.
+Login-free real-time streaming Speech-to-Text (ASR) SDKs and CLIs in **Swift**, **Rust**, **Python**, and **TypeScript**, reverse-engineered from **Doubao Input Method** (`DoubaoIme.app` v1.0.2) and **WeChat Input Method / WeType** (`WeType.app` v3.0.0) on macOS. TypeScript, Python and Rust also run on Linux using system FFmpeg/OpenSSL; no npm, pip or crates.io packages are required.
 
 ---
 
@@ -32,6 +32,55 @@ Zero-dependency, login-free real-time streaming Speech-to-Text (ASR) SDKs and CL
   - [`python/free_asr.py`](./python/free_asr.py)
 - **TypeScript SDK & CLI** (`typescript/package.json`, zero `npm` dependencies):
   - [`typescript/free_asr.ts`](./typescript/free_asr.ts)
+
+---
+
+## Linux support
+
+| SDK / CLI | macOS | Linux | System requirements on Linux |
+|---|---|---|---|
+| TypeScript | Yes | Yes | Node.js 22.18+; FFmpeg with `libopus` for WeType |
+| Python | Yes | Yes | Python 3.9+; system OpenSSL `libcrypto`; FFmpeg with `libopus` |
+| Rust | Yes | Yes | Rust 1.65+; OpenSSL development libraries at build time; CA certificates; FFmpeg with `libopus` |
+| Swift | Yes | No | Uses Apple AVFoundation, AudioToolbox and CommonCrypto |
+
+For Debian 12 / Ubuntu, install the relevant system dependencies:
+
+```sh
+sudo apt-get update
+sudo apt-get install ffmpeg libssl-dev ca-certificates python3
+# Install a supported Node.js / Rust toolchain separately.
+
+node typescript/free_asr.ts --provider wetype --file speech.wav --stream
+python3 python/free_asr.py --provider wetype --file speech.wav --stream
+cargo run --manifest-path rust/Cargo.toml -- --provider wetype --file speech.wav --stream
+```
+
+Use a **16 kHz, mono, signed 16-bit WAV or raw `.pcm`** file. Replace `wetype`
+with `doubao` to test the other service. `--say` is a macOS-only convenience;
+Linux uses `--file`. Linux Opus encoding uses FFmpeg rather than `afconvert`.
+Python uses OpenSSL's EVP AES API; Rust uses OpenSSL for AES/hash/TLS and
+verifies the server certificate chain and hostname against the system CA store.
+Node uses its built-in TLS/crypto. No account credentials are needed.
+
+`--stream` prints partial recognition results for the supplied file; it does
+not capture a Linux microphone. Applications can feed PCM to the SDK APIs.
+
+Offline checks (FFmpeg required):
+
+```sh
+python3 python/test_platform.py
+node typescript/test_platform.ts
+cargo test --manifest-path rust/Cargo.toml
+```
+
+Verified on 2026-10-30: Debian 12 x86_64, Node 22, Python 3.11, Rust 1.95,
+OpenSSL 3 and FFmpeg 5.1. All three clients transcribed the same Chinese test
+sentence through **both** WeType and Doubao. Rust was compiled inside that
+Linux environment; binaries built on newer glibc hosts are not portable to
+older distributions. macOS Swift WeType and TypeScript/Python/Rust build or
+codec checks were also exercised. See `tests/linux-smoke.sh` for the opt-in
+live test; it sends only the fixture file you supply to the selected services.
 
 ---
 
@@ -70,7 +119,7 @@ python3 python/free_asr.py --provider doubao --say "Python客户端测试豆包�
 python3 python/free_asr.py --provider wetype --file /path/to/audio.wav
 ```
 
-### 4. TypeScript (`typescript/free_asr.ts`, zero `npm` dependencies, Node.js 22.6+ / Bun)
+### 4. TypeScript (`typescript/free_asr.ts`, zero `npm` dependencies, Node.js 22.18+ / Bun)
 
 ```sh
 node typescript/free_asr.ts --provider wetype --say "TypeScript客户端测试微信输入法语音识别。" --stream

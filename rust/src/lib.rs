@@ -1,16 +1,27 @@
 //! Zero-dependency Rust SDK for Free ASR (Doubao IME & WeChat WeType IME).
 //!
-//! Links only against macOS system `Security.framework` (TLS) and `libSystem` (`CommonCrypto`),
+//! Uses macOS Security/CommonCrypto or Linux OpenSSL and FFmpeg,
 //! requiring zero third-party crates from crates.io.
 
+#[cfg(target_os = "macos")]
 use std::ffi::{c_char, c_int, c_void};
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(target_os = "macos")]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::ptr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{random_bytes, md5_upper, sha256_upper, aes256_ecb_encrypt, aes256_ecb_decrypt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
@@ -22,6 +33,7 @@ pub enum Provider {
 // 1. macOS System FFI: CommonCrypto (MD5, SHA256, AES-256-ECB) & Security TLS
 // ============================================================================
 
+#[cfg(target_os = "macos")]
 #[link(name = "System")]
 extern "C" {
     fn CC_MD5(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
@@ -42,13 +54,18 @@ extern "C" {
     fn arc4random_buf(buf: *mut c_void, nbytes: usize);
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct SSLContext(c_void);
 
+#[cfg(target_os = "macos")]
 type SSLConnectionRef = *const c_void;
+#[cfg(target_os = "macos")]
 type SSLReadFunc = extern "C" fn(SSLConnectionRef, *mut c_void, *mut usize) -> i32;
+#[cfg(target_os = "macos")]
 type SSLWriteFunc = extern "C" fn(SSLConnectionRef, *const c_void, *mut usize) -> i32;
 
+#[cfg(target_os = "macos")]
 #[link(name = "Security", kind = "framework")]
 extern "C" {
     fn SSLCreateContext(alloc: *const c_void, protocol_side: c_int, connection_type: c_int) -> *mut SSLContext;
@@ -61,16 +78,19 @@ extern "C" {
     fn SSLClose(ctx: *mut SSLContext) -> i32;
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRelease(cf: *const c_void);
 }
 
+#[cfg(target_os = "macos")]
 extern "C" {
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn ssl_read_cb(connection: SSLConnectionRef, data: *mut c_void, data_len: *mut usize) -> i32 {
     let fd = connection as usize as c_int;
     let requested = unsafe { *data_len };
@@ -91,6 +111,7 @@ extern "C" fn ssl_read_cb(connection: SSLConnectionRef, data: *mut c_void, data_
     0
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn ssl_write_cb(connection: SSLConnectionRef, data: *const c_void, data_len: *mut usize) -> i32 {
     let fd = connection as usize as c_int;
     let requested = unsafe { *data_len };
@@ -108,24 +129,28 @@ extern "C" fn ssl_write_cb(connection: SSLConnectionRef, data: *const c_void, da
     0
 }
 
+#[cfg(target_os = "macos")]
 pub fn random_bytes(len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     unsafe { arc4random_buf(buf.as_mut_ptr() as *mut c_void, len) };
     buf
 }
 
+#[cfg(target_os = "macos")]
 pub fn md5_upper(data: &[u8]) -> String {
     let mut digest = [0u8; 16];
     unsafe { CC_MD5(data.as_ptr() as *const c_void, data.len() as u32, digest.as_mut_ptr()) };
     digest.iter().map(|b| format!("{:02X}", b)).collect()
 }
 
+#[cfg(target_os = "macos")]
 pub fn sha256_upper(data: &[u8]) -> String {
     let mut digest = [0u8; 32];
     unsafe { CC_SHA256(data.as_ptr() as *const c_void, data.len() as u32, digest.as_mut_ptr()) };
     digest.iter().map(|b| format!("{:02X}", b)).collect()
 }
 
+#[cfg(target_os = "macos")]
 pub fn aes256_ecb_encrypt(key_ascii: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = vec![0u8; data.len() + 32];
     let mut moved = 0usize;
@@ -151,6 +176,7 @@ pub fn aes256_ecb_encrypt(key_ascii: &str, data: &[u8]) -> Result<Vec<u8>, Strin
     Ok(out)
 }
 
+#[cfg(target_os = "macos")]
 pub fn aes256_ecb_decrypt(key_ascii: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     if data.is_empty() {
         return Ok(Vec::new());
@@ -185,7 +211,10 @@ pub fn aes256_ecb_decrypt(key_ascii: &str, data: &[u8]) -> Result<Vec<u8>, Strin
 
 struct TlsWebSocket {
     _tcp: TcpStream,
+    #[cfg(target_os = "macos")]
     ctx: *mut SSLContext,
+    #[cfg(target_os = "linux")]
+    tls: linux::TlsStream,
     buf: Vec<u8>,
 }
 
@@ -200,24 +229,34 @@ impl TlsWebSocket {
         tcp.set_read_timeout(Some(Duration::from_secs(15))).ok();
         tcp.set_write_timeout(Some(Duration::from_secs(15))).ok();
 
-        let ctx = unsafe { SSLCreateContext(ptr::null(), 1 /* kSSLClientSide */, 0 /* kSSLStreamType */) };
-        if ctx.is_null() {
-            return Err("SSLCreateContext failed".to_string());
-        }
-        unsafe {
-            SSLSetIOFuncs(ctx, ssl_read_cb, ssl_write_cb);
-            SSLSetConnection(ctx, tcp.as_raw_fd() as usize as SSLConnectionRef);
-            SSLSetPeerDomainName(ctx, host.as_ptr() as *const c_char, host.len());
-            let st = SSLHandshake(ctx);
-            if st != 0 {
-                CFRelease(ctx as *const c_void);
-                return Err(format!("SSLHandshake failed: {}", st));
+        #[cfg(target_os = "macos")]
+        let ctx = {
+            let ctx = unsafe { SSLCreateContext(ptr::null(), 1 /* kSSLClientSide */, 0 /* kSSLStreamType */) };
+            if ctx.is_null() {
+                return Err("SSLCreateContext failed".to_string());
             }
-        }
+            unsafe {
+                SSLSetIOFuncs(ctx, ssl_read_cb, ssl_write_cb);
+                SSLSetConnection(ctx, tcp.as_raw_fd() as usize as SSLConnectionRef);
+                SSLSetPeerDomainName(ctx, host.as_ptr() as *const c_char, host.len());
+                let st = SSLHandshake(ctx);
+                if st != 0 {
+                    CFRelease(ctx as *const c_void);
+                    return Err(format!("SSLHandshake failed: {}", st));
+                }
+            }
+
+            ctx
+        };
+        #[cfg(target_os = "linux")]
+        let tls = linux::TlsStream::connect(&tcp, host)?;
 
         let mut ws = Self {
             _tcp: tcp,
+            #[cfg(target_os = "macos")]
             ctx,
+            #[cfg(target_os = "linux")]
+            tls,
             buf: Vec::new(),
         };
 
@@ -252,6 +291,7 @@ impl TlsWebSocket {
         Ok(ws)
     }
 
+    #[cfg(target_os = "macos")]
     fn tls_write_all(&mut self, data: &[u8]) -> Result<(), String> {
         let mut off = 0;
         while off < data.len() {
@@ -272,6 +312,7 @@ impl TlsWebSocket {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     fn tls_read(&mut self, out: &mut [u8]) -> Result<usize, String> {
         let mut processed = 0usize;
         let st = unsafe { SSLRead(self.ctx, out.as_mut_ptr() as *mut c_void, out.len(), &mut processed) };
@@ -281,6 +322,11 @@ impl TlsWebSocket {
             Err(format!("SSLRead failed: {}", st))
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn tls_write_all(&mut self, data: &[u8]) -> Result<(), String> { self.tls.write_all(data) }
+    #[cfg(target_os = "linux")]
+    fn tls_read(&mut self, out: &mut [u8]) -> Result<usize, String> { self.tls.read(out) }
 
     fn ensure_bytes(&mut self, n: usize) -> Result<(), String> {
         while self.buf.len() < n {
@@ -362,6 +408,7 @@ impl TlsWebSocket {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for TlsWebSocket {
     fn drop(&mut self) {
         unsafe {
@@ -656,6 +703,7 @@ fn snappy_decompress(data: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(target_os = "macos")]
 fn encode_wetype_opus_chunks(pcm: &[u8], frames_per_chunk: usize) -> Result<Vec<Vec<u8>>, String> {
     let pid = std::process::id();
     let in_wav = PathBuf::from(format!("/tmp/wetype_rs_in_{}.wav", pid));
@@ -745,6 +793,11 @@ fn encode_wetype_opus_chunks(pcm: &[u8], frames_per_chunk: usize) -> Result<Vec<
         chunks.push(cur);
     }
     Ok(chunks)
+}
+
+#[cfg(target_os = "linux")]
+fn encode_wetype_opus_chunks(pcm: &[u8], frames_per_chunk: usize) -> Result<Vec<Vec<u8>>, String> {
+    linux::encode_opus(pcm, frames_per_chunk)
 }
 
 fn rand_lower(len: usize) -> String {
